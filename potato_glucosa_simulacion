@@ -1,0 +1,1693 @@
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Importar bibliotecas
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+# Matplotlib- gráficos en tkinter
+from matplotlib.animation import FuncAnimation
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+from matplotlib import style
+from functools import partial
+import tkinter as tk
+from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+from PIL import ImageTk, Image
+# Para tratamiento de datos
+import pandas as pd
+import numpy as np
+import openpyxl # abrir excel
+from datetime import datetime, timedelta
+import matplotlib.dates as mdates
+# Para lógica difusa
+import skfuzzy as fuzz
+from skfuzzy import control as ctrl
+# Predicción ARIMA
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.stattools import acf
+from pmdarima.arima import auto_arima
+# Predicción Random Forest
+from sklearn.ensemble import RandomForestRegressor
+# Predicción RNN
+import torch
+import torch.nn as nn
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Estilo para la interfaz
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+LARGE_FONT=("Verdana",12)
+style.use ("ggplot")
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# DECLARACIÓN DE CONSTANTES
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Definición de valores máx y min de glucosa en sangre, marcan inicio de hiper e hipo glucemia respectivamente (pueden cambiar según persona)
+valor_min=70                                                        # valor límite hipoglucemia
+valor_max=160                                                       # valor límite hiperglucemia
+# Otras variables para simulación
+len_comienza_a_predecir=144                                         # nº de valores anteriores de glucosa que hay que tener para que el modelo comience a predecir (si toma valores cada 5 min=> hay que tener valores de las primeras 2.5 horas)
+const_ndata_24h=288                                                 # nº de mediciones de glucosa que corresponden a 24h (si se toman datos cada 5 min=>288)
+len_comienzan_tendencias=3                                          # nº de mediciones anteriores para que empiecen a calcularse tendencias (si se toman datos cada 5 mins=> hay que tener datos de al menos datos de 15 mins para empezar a sacar tendencias)
+const_alerta=20                                                     # constante inicial simulada para lógica difusa (emociones)
+const_animica=79.99                                                 # alegre inicial simulada para lógica difusa (emociones)
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# DECLARACIÓN DE LAS FIGURAS (PLOTS)
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Figura para la curva de glucosa en tiempo real
+f1 = Figure(dpi=100)
+a1 = f1.add_subplot(111)
+# Figuras para funciones de pertenencia (lógica difusa)
+f2=Figure(dpi=100)
+a2=f2.add_subplot(111)
+a2.set_title("Función de pertenencia Glucosa")
+f3=Figure(dpi=100)
+a3=f3.add_subplot(111)
+a3.set_title("Función de pertenencia Luz")
+f4=Figure(dpi=100)
+a4=f4.add_subplot(111)
+a4.set_title("Función de pertenencia Alerta")
+f5=Figure(dpi=100)
+a5=f5.add_subplot(111)
+a5.set_title("Función de pertenencia Anímica")
+f6=Figure(dpi=100)
+a6=f6.add_subplot(111)
+a6.set_title("Función de pertenencia Estado General")
+# Figuras para plots de ARIMA (acf y pacf)
+f7=Figure(dpi=100)
+a7=f7.add_subplot(111)
+a7.set_title("ACF Plot")
+f8=Figure(dpi=100)
+a8=f8.add_subplot(111)
+a8.set_title("PACF Plot")
+# Figura glucosa-alerta (evolución del nivel de alerta según el nivel de glucosa)
+f9=Figure(dpi=100)
+a9=f9.add_subplot(111)
+a9.set_title("Glucosa-Alerta")
+a9_2 = a9.twinx() # segundo eje de ordenadas en parte derecha del gráfico
+# Figura comparación predicciones futuras
+f10=Figure(dpi=100)
+a10=f10.add_subplot(111)
+# Figura comparación predicciones (lineas continuas)
+f11=Figure(dpi=100)
+a11=f11.add_subplot(111)
+# Figura compración predicciones (arima con parámetros elegidos y autoarima)
+f12=Figure(dpi=100)
+a12=f12.add_subplot(111)
+
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# CLASE RNNModel (Predicción con Redes Neuronales)
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+class RNNModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, drop_prob=0.2):
+        super(RNNModel, self).__init__()
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True, dropout=drop_prob)
+        self.fc = nn.Linear(hidden_size, output_size)
+ 
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        out = self.fc(out)
+        return out
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# CLASE GLUCOSASIMULATOR
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+class GlucosaSimulator:
+    def __init__(self,app):
+        # Atributos de la clase
+            # Variable dónde se almacena los valores de glucosa medidos en el tiempo, junto con las predicciones (y sus errores) hechas para esos instantes de tiempo con distintos modelos de predicción
+        self.datos_historicos_glucosa = pd.DataFrame(columns=["DateTime","Blood Glucose (mg/dL)","Prediction ARIMA", "Error ARIMA", "Prediction Regression", "Error Regression", "Prediction Random Forest", "Error Random Forest", "Prediction RNN", "Error RNN"])
+            # Variable en la que se almacenan las predicciones hechas con distintos modelos de predicción para los distintos instantes de tiempo
+        self.prediccion = pd.DataFrame(columns=["DateTime next step","Prediction ARIMA next step", "Prediction autoarima next step", "Prediction Regression next step", "Prediction Random Forest next step", "Prediction RNN next step"])
+        # Predicciones: nº de valores futuros que se predicen
+        self.steps= 10
+        # Atributos de ARIMA/SARIMA
+        self.order=None                                             # parámetros para ARIMA (p, d, q)
+        self.ajustar_param_arima= True
+        # Control de historico de datos
+        self.len_datos_previos = 0                                  # nº de datos previos almacenados de glucosa del usuario antes de "reiniciar" (almacenados en excel, desde comienzo de uso)
+        self.datos_previos = False                                  # variable para indicar si cuando se pone en uso hay datos previos de glucemia
+        self.fila_actual = 1                                        # para simulación: fila de la que se cogen datos de glucemia del excel
+        self.medicion_prediccion = False                            # variable para indicar cuando empezar a realizar predicciones
+        self.first_medicion_glucosa_con_prediccion = False          # variable que indica si es la primera vez que se entra a realizar predicciones (primera vez que se tienen suficientes valores anteriores como para realizar predicciones)
+        # Parámetros para simular nuevos valores de glucosa (para simulación, si no hay suficientes valores en el excel)
+        self.media=80   
+        self.desviacion=10
+        # Control estadístico de glucosa
+        self.historico_TIR= pd.DataFrame(columns=["DateTime", "TIR 70-180 (%)", "TIR <70 (%)", "TIR >180 (%)"])
+        self.TIR=70                                                 # Time in range (% de tiempo en rango)
+        self.belowTIR=4                                             # Time below range (% de tiempo por debajo de rango [<70])
+        self.aboveTIR=25                                            # Time above range (% de tiempo por encima de rango [>180])
+        self.media_glucosa=80                                       # variable para almacenar la glucosa media
+        self.estadisticas= pd.DataFrame(columns=["DateTime", "TIR 70-180 (%)", "TIR <70 (%)", "TIR >180 (%)", "mean"])
+        # Cargar el archivo Excel en que se encuentran las mediciones de glucosa (tomamamos medidas de este excel para simulación)
+        self.medidas_sensor_glucosa_excel = "sensor_data1.xlsx"
+        self.medidas_sensor_glucosa_excel_hoja_nombre = "Datos enviados"
+        self.libro = openpyxl.load_workbook(self.medidas_sensor_glucosa_excel)
+        self.hoja = self.libro[self.medidas_sensor_glucosa_excel_hoja_nombre]
+        # Para sacar texto por ventana Intefaz
+        self.ventana_instancia=app                                  # Instancia de la ventana de tkinter creada (para sacar texto y plots por ventana)
+    
+
+    # Método para generar un nuevo valor de glucosa simulado a partir de la media y la desviación de los valores de glucosa (mediciones) anteriores [Para simulación, si se acaban datos de excel]
+    def generar_valor_glucosa(self):
+        valor_glucosa = np.random.normal(loc=self.media, scale=self.desviacion)
+        return valor_glucosa
+
+
+    # Método que obtiene la medición de glucosa nueva (se obtiene del excel o mediante la generación de un valor aleatorio [generar_valor_glucosa()] en caso de que ya se hayan utilizado todos los valores del excel)
+    def medicion_glucosa(self):
+        if self.fila_actual <= self.hoja.max_row:                   # Si quedan valores en el excel tomarlos de ahí...
+            celda = self.hoja.cell(row=self.fila_actual, column=1)  # Obtener el valor de la columna en la que se encuentran (columna A), y fila (self.fila_actual)
+            valor = celda.value                                     
+            if valor is None:                                       # Verificar si la celda está vacía (fin de la columna)
+                self.libro.close()                                  # Si la celda está vacía=> no hay más valores en excel (para simulación)=> Cerrar el archivo Excel después de terminar
+            self.fila_actual += 1                                   # Pasar a la siguiente fila (para en la siguiente iteración, coger el siguiente valor)
+        else:                                                       # ... Si no quedan valores en el excel...
+            valor = self.generar_valor_glucosa()                    # ... se general de manera aleatoria (a partir de media y desviación)
+        return valor                                                # Se devuelve nuevo valor de glucosa "medido"
+
+
+    # Método que devuelve la fecha actual
+    def fecha(self):
+        fecha = datetime.now().strftime('%Y-%m-%d %H:%M:%S')        
+        return fecha
+
+
+    # Método que carga a excel las mediciones y predicciones de glucosa obtenidas (archivo de datos históricos)
+    def pasar_a_excel(self):
+        # Preparar datos para pasar a excel "self.datos_historicos_glucosa"
+        datos_historicos_glucosa_copia = self.datos_historicos_glucosa.copy()
+        # Redondear a dos decimales los datos de la columna "Blood Glucose (mg/dL)" según sea o no necesario
+        datos_historicos_glucosa_copia["Blood Glucose (mg/dL)"] = datos_historicos_glucosa_copia["Blood Glucose (mg/dL)"].apply(
+            lambda x: round(x, 2) if isinstance(x, float) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction ARIMA" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Prediction ARIMA"] = datos_historicos_glucosa_copia["Prediction ARIMA"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Error ARIMA" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Error ARIMA"] = datos_historicos_glucosa_copia["Error ARIMA"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction Regression" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Prediction Regression"] = datos_historicos_glucosa_copia["Prediction Regression"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Error Regression" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Error Regression"] = datos_historicos_glucosa_copia["Error Regression"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction Random FOrest" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Prediction Random Forest"] = datos_historicos_glucosa_copia["Prediction Random Forest"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Error Random Forest" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Error Random Forest"] = datos_historicos_glucosa_copia["Error Random Forest"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction RNN" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Prediction RNN"] = datos_historicos_glucosa_copia["Prediction RNN"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Error RNN" según sea o no necesario (si no son None)
+        datos_historicos_glucosa_copia["Error RNN"] = datos_historicos_glucosa_copia["Error RNN"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Preparar para pasar a excel datos históricos de predicciones "self.prediccion"
+        prediccion_copia = self.prediccion.copy()
+        # Redondear a dos decimales los datos de la columna "Prediction ARIMA next step" según sea o no necesario (si no son None)
+        prediccion_copia["Prediction ARIMA next step"] = prediccion_copia["Prediction ARIMA next step"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction autoarima next step" según sea o no necesario (si no son None)
+        prediccion_copia["Prediction autoarima next step"] = prediccion_copia["Prediction autoarima next step"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction Regression next step" según sea o no necesario (si no son None)
+        prediccion_copia["Prediction Regression next step"] = prediccion_copia["Prediction Regression next step"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction Random Forest next step" según sea o no necesario (si no son None)
+        prediccion_copia["Prediction Random Forest next step"] = prediccion_copia["Prediction Random Forest next step"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Redondear a dos decimales los datos de la columna "Prediction RNN next step" según sea o no necesario (si no son None)
+        prediccion_copia["Prediction RNN next step"] = prediccion_copia["Prediction RNN next step"].apply(
+            lambda x: round(x, 2) if (isinstance(x, float) and not pd.isnull(x)) else x
+        )
+        # Volcar datos a excel
+        datos_historicos_glucosa_copia.to_excel('datos_historicos.xlsx', index_label='DateTime')
+        prediccion_copia.to_excel('predicciones.xlsx', index_label='DateTime next step')
+
+
+    # Método medición de glucosa sin predicción
+    def medicion_glucosa_sin_prediccion(self):
+        fecha_actual = self.fecha()
+        #fecha_prox_medicion = ((datetime.strptime(fecha_actual, '%Y-%m-%d %H:%M:%S')) + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')
+        fecha_prox_medicion = ((datetime.strptime(fecha_actual, '%Y-%m-%d %H:%M:%S')) + timedelta(seconds=1)).strftime('%Y-%m-%d %H:%M:%S')
+        glucosa_actual = self.medicion_glucosa()
+        nueva_fila = pd.DataFrame([[glucosa_actual, None, None, None, None, None, None, None, None]], columns=['Blood Glucose (mg/dL)', 'Prediction ARIMA', 'Error ARIMA', 'Prediction Regression', 'Error Regression', 'Prediction Random Forest', 'Error Random Forest', 'Prediction RNN', 'Error RNN'], index=[pd.to_datetime(fecha_actual)])
+        # Agregar nueva fila al DataFrame de datos históricos "datos_historicos_glucosa"
+        if len(self.datos_historicos_glucosa) == 0:
+            self.datos_historicos_glucosa = nueva_fila
+        else:
+            self.datos_historicos_glucosa = pd.concat([self.datos_historicos_glucosa, nueva_fila])
+        # Agregar nuevas filas vacías al DataFrame "prediccion" (todavía no se están haciendo predicciones)
+        nueva_prediccion = pd.DataFrame([[None, None, None, None, None]], columns=['Prediction ARIMA next step', 'Prediction autoarima next step', 'Prediction Regression next step', 'Prediction Random Forest next step', 'Prediction RNN next step'], index=[pd.to_datetime(fecha_prox_medicion)])
+        if len(self.prediccion) == 0: # Si es la primera vez que se meten valores a predicción....
+            self.prediccion = pd.DataFrame([[None, None, None, None, None]], columns=['Prediction ARIMA next step', 'Prediction autoarima next step', 'Prediction Regression next step', 'Prediction Random Forest next step', 'Prediction RNN next step'], index=[pd.to_datetime(fecha_actual)])
+            self.prediccion = pd.concat([self.prediccion, nueva_prediccion])
+        else:
+            self.prediccion = pd.concat([self.prediccion, nueva_prediccion])
+        # Volcar datos a excel
+        self.pasar_a_excel()
+
+
+    # Método medición de glucosa + predicción próximos valores
+    def medicion_glucosa_con_predicciones(self):
+        # Medición actual de glucosa
+        fecha_actual = self.fecha()
+        glucosa_actual = self.medicion_glucosa()
+        # Predicciones próximas de glucosa
+            # Se genera el index de tiempo: datetimes correspondientes a los siguentes valores (tiempos próximos para los que se predicen valores)
+        fechas_prox_i_val_formato=pd.DataFrame(columns=['DateTime next step', 'columna_vacia'])
+        fechas_prox_i_val_formato = fechas_prox_i_val_formato.set_index('DateTime next step')
+        fechas_proximas=pd.DataFrame(columns=['DateTime next step', 'columna_vacia'])
+        fechas_proximas = fechas_proximas.set_index('DateTime next step')
+        for i in range (1, self.steps+1):
+            #fecha_prox_i_val= ((datetime.strptime(fecha_actual, '%Y-%m-%d %H:%M:%S')) + timedelta(minutes=(i*5))).strftime('%Y-%m-%d %H:%M:%S')
+            fecha_prox_i_val= ((datetime.strptime(fecha_actual, '%Y-%m-%d %H:%M:%S')) + timedelta(seconds=i)).strftime('%Y-%m-%d %H:%M:%S')
+            fecha_prox_i_val_formato=pd.DataFrame([[None]], columns=['columna_vacia'], index=[pd.to_datetime(fecha_prox_i_val)])
+            fechas_proximas= pd.concat([fechas_proximas, fecha_prox_i_val_formato])
+        # Si es la primera vez entra a la función cuando no hay datos previos (excel sin info)=> no hay predicciones previas...
+        if self.first_medicion_glucosa_con_prediccion:                              
+            self.first_medicion_glucosa_con_prediccion = False
+            # La primera vez que se puede predecir... para este momento actual no tenemos predicciones "None"....
+            nueva_fila = pd.DataFrame([[glucosa_actual, None, None, None, None, None, None, None, None]], columns=['Blood Glucose (mg/dL)', 'Prediction ARIMA', 'Error ARIMA', 'Prediction Regression', 'Error Regression', 'Prediction Random Forest', 'Error Random Forest', 'Prediction RNN', 'Error RNN'], index=[pd.to_datetime(fecha_actual)])        
+            self.datos_historicos_glucosa = pd.concat([self.datos_historicos_glucosa, nueva_fila])
+            # ... pero es ahora cuando se sacan las predicciones para los próximos valores (la siguiente vez que se entra en "medicion_glucosa_con_predicciones", se tiene para esa hora el valor de glucosa medido y los que se habían predicho para ese momento)
+            self.ajustar_param_arima=True # La primera vez que se comienza a predecir se ajustan los parámetros del modelo arima (con autoarima)
+            predicciones_siguientes_arima = self.ajustar_modelo_y_predecir_arima()
+            predicciones_siguientes_autoarima= self.ajustar_modelo_y_predecir_arima_autoarima()
+            predicciones_siguientes_regresion= self.predecir_regresion()
+            predicciones_siguientes_regresion_transform = pd.Series(predicciones_siguientes_regresion, index=predicciones_siguientes_arima.index)
+            predicciones_siguientes_randomforest= self.predecir_randomforest()
+            predicciones_siguientes_rnn= self.predecir_rnn()
+            predicciones_siguientes_rnn_transform= predicciones_siguientes_rnn.numpy().flatten()
+            nuevas_predicciones = pd.DataFrame({'Prediction ARIMA next step': predicciones_siguientes_arima, 'Prediction autoarima next step': predicciones_siguientes_autoarima,'Prediction Regression next step': predicciones_siguientes_regresion_transform, 'Prediction Random Forest next step': predicciones_siguientes_randomforest, 'Prediction RNN next step': predicciones_siguientes_rnn_transform}, index=fechas_proximas.index)
+        # ...si no es la primera vez que se hacen predicciones
+        else:                                                       
+            # Se coge la predicción que se había calculado en la anterior iteración para el tiempo actual...
+            if self.prediccion['Prediction ARIMA next step'][-self.steps] == None:
+                prediccion_este_val_arima = self.ajustar_modelo_y_predecir_arima()
+                prediccion_este_valor_arima = prediccion_este_val_arima.iloc[0]
+            else:
+                prediccion_este_valor_arima = self.prediccion['Prediction ARIMA next step'][-self.steps]
+            if self.prediccion['Prediction Regression next step'][-self.steps] == None:
+                prediccion_este_val_regresion= self.predecir_regresion()
+                prediccion_este_valor_regresion= prediccion_este_val_regresion[0]
+            else:
+                prediccion_este_valor_regresion=self.prediccion['Prediction Regression next step'][-self.steps]
+            if self.prediccion['Prediction Random Forest next step'][-self.steps] == None:
+                prediccion_este_val_randomforest= self.predecir_randomforest()
+                prediccion_este_valor_randomforest= prediccion_este_val_randomforest[0]
+            else:
+                prediccion_este_valor_randomforest= self.prediccion['Prediction Random Forest next step'][-self.steps]
+            if self.prediccion['Prediction RNN next step'][-self.steps] == None:
+                prediccion_este_val_rnn= self.predecir_rnn()
+                prediccion_este_valor_rnn= prediccion_este_val_rnn[0]
+            else:
+                prediccion_este_valor_rnn= self.prediccion['Prediction RNN next step'][-self.steps]
+            # Error en la predicción para la medición actual (en que % difiere la predicción que se había hecho de el valor de glucosa que realmente se ha medido)
+            error_arima= np.abs((glucosa_actual - prediccion_este_valor_arima)/glucosa_actual)*100
+            error_regresion= np.abs((glucosa_actual - prediccion_este_valor_regresion)/glucosa_actual)*100
+            error_randomforest= np.abs((glucosa_actual - prediccion_este_valor_randomforest)/glucosa_actual)*100
+            error_rnn= np.abs((glucosa_actual - prediccion_este_valor_rnn)/glucosa_actual)*100
+            # Datos a guardar en el histórico de datos
+            nueva_fila = pd.DataFrame([[glucosa_actual, prediccion_este_valor_arima, error_arima, prediccion_este_valor_regresion, error_regresion, prediccion_este_valor_randomforest, error_randomforest, prediccion_este_valor_rnn, error_rnn]], columns=['Blood Glucose (mg/dL)', 'Prediction ARIMA', 'Error ARIMA', 'Prediction Regression', 'Error Regression', 'Prediction Random Forest', 'Error Random Forest', 'Prediction RNN', 'Error RNN'], index=[pd.to_datetime(fecha_actual)])
+            self.datos_historicos_glucosa = pd.concat([self.datos_historicos_glucosa, nueva_fila])
+            #... Y se realizan las predicciones para los próximos tiempos (próximas iteraciones)
+            predicciones_siguientes_arima = self.ajustar_modelo_y_predecir_arima()
+            predicciones_siguientes_autoarima= self.ajustar_modelo_y_predecir_arima_autoarima()
+            predicciones_siguientes_regresion= self.predecir_regresion()
+            predicciones_siguientes_regresion_transform = pd.Series(predicciones_siguientes_regresion, index=predicciones_siguientes_arima.index)
+            predicciones_siguientes_randomforest= self.predecir_randomforest()
+            predicciones_siguientes_rnn= self.predecir_rnn()
+            predicciones_siguientes_rnn_transform= predicciones_siguientes_rnn.numpy().flatten()
+            nuevas_predicciones = pd.DataFrame({'Prediction ARIMA next step': predicciones_siguientes_arima, 'Prediction autoarima next step': predicciones_siguientes_autoarima, 'Prediction Regression next step': predicciones_siguientes_regresion_transform, 'Prediction Random Forest next step': predicciones_siguientes_randomforest, 'Prediction RNN next step': predicciones_siguientes_rnn_transform}, index=fechas_proximas.index)
+        # Actualizar variable que guarda las predicciones (sobreescribe los self.step-1 últimos, ya que en la siguiente iteración tenemos nuevas predicciones para esos valores)
+        print('\nPredicción de los próximos 10 valores de glucosa:')
+        print(nuevas_predicciones)
+        self.prediccion=self.prediccion.iloc[:-(self.steps-1)]
+        self.prediccion = pd.concat([self.prediccion, nuevas_predicciones])                     #Le meto 'step' valores de predicciones próximas
+        self.pasar_a_excel()                                                                    # Volcar nuevos datos a excel
+    
+
+    # Método que realiza predicciones mediante Regresión Lineal
+    def predecir_regresion(self):
+        print("\nHe entrado a predecir_regresion")
+        series=self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-self.steps:]             # Se cogen los últimos "self.steps" valores para predecir los siguientes "self.steps"
+        coefs= np.polynomial.polynomial.polyfit(x=np.arange(self.steps), y=series, deg=1)
+        predictions=np.polyval(p=np.flip(coefs, axis=0), x=np.arange(self.steps)+self.steps)
+        print("Predicciones regresión:")
+        print(type(predictions))
+        print (predictions)
+        return predictions
+    
+
+    # Método que realiza predicciones mediante Random Forest
+    def predecir_randomforest(self):
+        print("\n He entrado a predecir random forest")
+        series = self.datos_historicos_glucosa['Blood Glucose (mg/dL)']
+        y = series.values                                                                       # Convierte la serie en un array NumPy
+        y = y.reshape(-1, 1)
+        y = y.ravel()                                                                           # Cambia dimensión de y
+        X = np.arange(len(y)).reshape(-1, 1)                                                    # Las características son índices
+        model = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=0)
+        predictions = []                                                                        # Se inicializa una lista donde se van a guardar las predicciones
+        for i in range(self.steps):                                                             # Se predice un sólo próximo valor, éste se une a las anteriores mediciones, y así se puede predecir otro valor más... así hasta llegar a "self.steps" mediciones 
+            model.fit(X, y)                                                                     # Entrenar el modelo con los datos actuales
+            siguiente_tiempo = len(y) + i                                                       # Siguiente punto en el tiempo
+            siguiente_tiempo_array = np.array(siguiente_tiempo).reshape(-1, 1)
+            p = model.predict(siguiente_tiempo_array)                                           # Realizar una predicción para el siguiente punto en el tiempo
+            predictions.append(p)                                                               # Se guarda la predicción hecha en en la lista que se ha inicializado anteriomente
+            y = np.append(y, p)                                                                 # Actualizar el conjunto de datos con el valor predicho (para así poder predecir más valores)
+            X = np.append(X, siguiente_tiempo).reshape(-1, 1)
+        predicciones=[x[0] for x in predictions]
+        print("Predicciones Random Forest:")
+        print (type(predictions))
+        print (predicciones)
+        return predicciones
+    
+
+    # Método que realiza predicción mediante RNN
+    def predecir_rnn(self):
+        print("\n He entrado a predecir RNN")
+        series = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-self.steps:]
+        y = series.values                                                                       # Convierte la serie en un array NumPy
+        y = y.tolist()                                                                          # Convierte la serie en una lista de Python
+        y = torch.Tensor(y)                                                                     # Crea un tensor de PyTorch a partir de la lista
+        y = y.view(1, -1)
+        rnn_model = RNNModel(input_size=self.steps, hidden_size=512, num_layers=2, output_size=self.steps)
+        rnn_model.load_state_dict(torch.load('rnn_model_ten.pth', map_location=torch.device('cpu'))) # Cargar el modelo y mapearlo en la CPU
+        rnn_model.eval()
+        with torch.no_grad():                                                                   # Mover el input data a CPU si no está ya ahí
+            y = y.to('cpu')
+            predictions = rnn_model(y)
+        print("Predicciones RNN:")
+        print(type(predictions))
+        print(predictions)
+        return predictions
+    
+
+    # Método que realiza predicciones mediante el modelo ARIMA (se han establecido mediante análisis los parámetros que se han encontrado adecuados)
+    def ajustar_modelo_y_predecir_arima(self):
+        print('\nHe entrado a ajustar_modelo_y_predecir_arima')
+        series=self.datos_historicos_glucosa['Blood Glucose (mg/dL)']                           # Coger valores históricos (valores previos de glucosa), para predecir los siguientes
+        print(len(series))
+        if len(series) > 0:
+            series.index = pd.to_datetime(series.index)
+            #series=series.asfreq('5T') # Frecuencia de muestreo de 5 minutos
+            series=series.asfreq('S', method='ffill')
+        print(len(series))
+        fuller=adfuller(series)                                                                 # Dickey-Fuller test (check for stationarity). null hypothesis: non stationary
+        print('ADF Statistic: %f' %fuller[0])
+        print('p-value: %f' % fuller[1])                                                        # Si p>0.05=> we cannot reject the hypothesis=> datos no estacionario// Si p<0.05=> we can reject the hypothesis=> datos estacionarios=> d=0 (orden de diferenciación)
+        print('Critical Values:')
+        for key, value in fuller[4].items():
+            print('\t%s: %.3f' % (key, value))
+        # ACF (Gráfico de autocorrelación)=> q (decaimiento gradual de las autocorrelaciones después de cierto nº de regazos, esto indica el valor adecuado para q)
+        a7.clear()
+        acf_result=acf(series, nlags=30)
+        plot_acf(series,lags=30, ax=a7)                                                         # Mediante la observación de este gráfico se saca el valor del parámetro q (orden del componente de promedio móvil (MA))
+        a7.set_title("ACF Plot")
+        #acf_data=pd.DataFrame(acf_result, columns=['acf'])
+        #print (acf_data)
+        # PACF (Gráfico de autocorrelación parcial)=> los picos significativos en el gráfico dan pistas sobre los valores de p
+        a8.clear()
+        plot_pacf(series, lags=15, ax=a8)                                                       # Mediante la observación de este gráfico se saca el valor del parámetro p (orden del componente autorregresivo (AR))
+        self.ventana_instancia.update_plot_ARIMA()                                              # Método para mostrar en ventan los gráficos ACF (gráfico de autocorrelación) y PACF (gráfico de autocorrelación parcial)   
+        model = ARIMA(series,order=(3,0,0))                                                     # Ajuste de un modelo ARIMA con los ordenes determinados
+        model_fit = model.fit()                                                                 # Ajuste del modelo ARIMA a la serie de datos utilizando el método fit
+        prediction= model_fit.forecast(steps=self.steps)                                        # Se utiliza el método forecast para hacer "self.steps" predicciones
+        print("Predicciones arima:")
+        print(type(prediction))
+        print(prediction)
+        return prediction
+    
+
+    # Método que realiza predicciones mediante el modelo ARIMA (los parámetros de ARIMA los saca el método autoarima)
+    def ajustar_modelo_y_predecir_arima_autoarima(self):
+        print('\nHe entrado a ajustar_modelo_y_predecir_arima_autoarima')
+        series=self.datos_historicos_glucosa['Blood Glucose (mg/dL)']                           # Coger valores históricos (valores previos de glucosa)
+        print(len(series))
+        if len(series) > 0:
+            series.index = pd.to_datetime(series.index)
+            #series=series.asfreq('5T') # Frecuencia de muestreo de 5 minutos
+            series=series.asfreq('S', method='ffill')
+        print(len(series))
+        if self.ajustar_param_arima:                                                            # Si es la primera vez que se entra a realizar predicciones se ajustan los parámetros para ARIMA
+            model=auto_arima(series, error_action='ignore', stepwise=True)                      # Se emplea el método auto_arima para que devuelva el "best fit" para los parámetros de ARIMA
+            self.order=model.order
+            self.ajustar_param_arima=False                                                      # para que no se vuelvan a ajustar parámetros (coste computacional)
+        print("auto_arima Orders:", self.order)                                     
+        model = ARIMA(series,order=self.order)
+        model_fit = model.fit()                                                                 # Ajuste del modelo ARIMA a la serie de datos utilizando el método fit
+        prediction= model_fit.forecast(steps=self.steps)                                        # Se utiliza el método forecast para hacer "self.steps" predicciones
+        print("Predicciones auto_arima:")
+        print(type(prediction))
+        print(prediction)
+        return prediction
+
+
+    # Método que controla la recolección de los posibles datos anteriores que haya almacenados, la toma de nuevos valores de glucosa y simultáneamente la predicción de los siguientes valores de glucosa.
+    def recoleccion_medicion_prediccion_datos(self):
+        print("Longitud de datos previos:", len(self.datos_historicos_glucosa))
+        if len(self.datos_historicos_glucosa) < len_comienza_a_predecir:                        # No hay suficientes datos anteriores para predecir
+            print('datos_previos:', self.datos_previos)
+            if not self.datos_previos:                                                          # si no hay datos previos (datos_previos=False)...
+                self.media = 80
+                self.desviacion = 10
+                self.datos_previos = True
+                print('no datos previos')
+            else:                                                                               # sí hay datos previos (datos_previos=True), pero no suficientes para predecir...
+                if len(self.datos_historicos_glucosa) >= 5:                                     # si hay más de 5 datos previos
+                    ultimos_valores = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].tail(5)
+                    self.media = ultimos_valores.mean()
+                    print('Más de 5 valores')
+                else:                                                                           # si hay menos de 5 datos previos
+                    self.media = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-1]
+                    print('Menos de 5 valores') 
+                self.desviacion = 5
+            print(f'Tomando los primeros {len_comienza_a_predecir} valores (medición sin predicción)')
+            self.medicion_glucosa_sin_prediccion()                                              #... se obtiene la medición de glucosa pero no se predice el próximo valor
+        else:                                                                                   # Si hay más de 120 datos previos de glucosa...
+            ultimos_valores = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].tail(5)
+            self.media = ultimos_valores.mean()
+            self.desviacion = 5
+            print('Medición con predicción')
+            self.medicion_glucosa_con_predicciones()                                            #... se obtiene la medición de glucosa y se predicen los próximos valores que tomará la glucosa en sangre
+
+
+    # Método para cargar datos históricos de glucosa
+    def obtener_datos_historicos_glucosa(self):
+        try:                                                                                    # intentar...
+            print('Abriendo archivos ...')
+            data_historical = pd.read_excel('datos_historicos.xlsx', index_col='DateTime')
+            predict_historical = pd.read_excel('predicciones.xlsx', index_col='DateTime next step')
+            statics_historical= pd.read_excel('estadisticas_glucosa.xlsx', index_col='DateTime')
+            self.datos_previos = True
+            self.len_datos_previos = len(data_historical)
+        except FileNotFoundError:                                                               #...si no encuentra excel.. no tenemos datos históricos
+            print("Archivo no encontrado. No hay datos históricos")
+            self.datos_previos = False
+            self.first_medicion_glucosa_con_prediccion = True
+        if self.datos_previos:
+            print('...Hay datos previos')
+            return data_historical, predict_historical, statics_historical
+        else:
+            return pd.DataFrame(columns=["DateTime","Blood Glucose (mg/dL)","Prediction ARIMA"]), pd.DataFrame(columns=["DateTime next step","Prediction ARIMA next step"]), pd.DataFrame(columns=["DateTime", "TIR 70-180 (%)", "TIR <70 (%)", "TIR >180 (%)", "mean"])
+    
+
+    # Método que se encarga de actualizar todos los gráficos
+    def update_plots(self):
+        self.plot_curva_glucosa()                                           
+        self.plot_curva_comparacion_prediccion()
+        self.plot_curva_continuo_comparacion_predicciones()
+        self.plot_curva_continuo_comparacion_arima()
+
+
+    # Método que representa la curva de glucosa en sangre junto con las próximas 'self.steps' predicciones (con método ARIMA) del valor que tomará la glucosa en sangre
+    def plot_curva_glucosa(self):
+        if ((len(self.datos_historicos_glucosa)-self.len_datos_previos) > const_ndata_24h):     # Si hay datos de más de 24 h, coger solo datos de las últimas 24 h
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[const_ndata_24h:]
+            hora_glucemia = self.datos_historicos_glucosa.index[const_ndata_24h:]
+        else:                                                                                   # si hay datos de menos de 24 h, coger todods los valores
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[self.len_datos_previos:]
+            hora_glucemia = self.datos_historicos_glucosa.index[self.len_datos_previos:]
+        nueva_prediccion = self.prediccion['Prediction ARIMA next step'].iloc[-(self.steps):] if not self.prediccion.empty else None
+        hora_prediccion = self.prediccion.index[-(self.steps):] if not self.prediccion.empty else None
+        a1.clear()
+        a1.set_title('Curva glucemia en tiempo real')
+        a1.set_xlabel('Día y Hora')
+        a1.set_ylabel('Nivel de glucemia(mg/dl)')
+        # Color de los puntos según el valor de mediciones (rojo si hipo o hiper glucemia)
+        color_niveles = ['red' if (nivel > valor_max) or nivel < (valor_min) else 'blue' for nivel in niveles_glucemia]
+        # Recta que une los puntos de mediciones de glucosa
+        a1.plot(hora_glucemia, niveles_glucemia, color='black', linestyle='-', label='Mediciones')
+        # Pintar los puntos de mediciones con los colores definidos anteriormente
+        a1.scatter(hora_glucemia, niveles_glucemia, color=color_niveles, marker='o', s=30)
+        # Representar predicciones
+        if nueva_prediccion is not None and hora_prediccion is not None:
+            a1.scatter(hora_prediccion, nueva_prediccion, marker='s', color='orange', label='Predicciones ARIMA', s=20)
+        a1.legend()
+        a1.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y %H:%M'))                    # Formatear el eje de las abscisas para mostrar las fechas completas
+    
+
+    # Método que representa la curva de glucosa en sangre junto con las próximas 'self.steps' predicciones (que sacan todos los diferentes métodos) del valor que tomará la glucosa en sangre
+    def plot_curva_comparacion_prediccion(self):
+        if ((len(self.datos_historicos_glucosa)-self.len_datos_previos) > const_ndata_24h):     # Si hay datos de más de 24 h, coger solo datos de las últimas 24 h
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[const_ndata_24h:]
+            hora_glucemia = self.datos_historicos_glucosa.index[const_ndata_24h:]
+        else:                                                                                   # si hay datos de menos de 24 h, coger todods los valores
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[self.len_datos_previos:]
+            hora_glucemia = self.datos_historicos_glucosa.index[self.len_datos_previos:]
+        # Valores de las próximas predicciones
+        nueva_prediccion_arima = self.prediccion['Prediction ARIMA next step'].iloc[-(self.steps):] if not self.prediccion.empty else None
+        nueva_prediccion_regression = self.prediccion['Prediction Regression next step'].iloc[-(self.steps):] if not self.prediccion.empty else None
+        nueva_prediccion_randomforest= self.prediccion['Prediction Random Forest next step'].iloc[-(self.steps):] if not self.prediccion.empty else None
+        nueva_prediccion_rnn= self.prediccion['Prediction RNN next step'].iloc[-(self.steps):] if not self.prediccion.empty else None
+        hora_prediccion = self.prediccion.index[-(self.steps):] if not self.prediccion.empty else None
+        a10.clear()
+        a10.set_title('Curva glucemia en tiempo real con varios modelos de predicción')
+        a10.set_xlabel('Día y Hora')
+        a10.set_ylabel('Nivel de glucemia(mg/dl)')
+        # Color de los puntos según el valor de mediciones (rojo si hipo o hiper glucemia)
+        color_niveles = ['red' if (nivel > valor_max) or nivel < (valor_min) else 'blue' for nivel in niveles_glucemia]
+        # Recta que une los puntos de mediciones de glucosa
+        a10.plot(hora_glucemia, niveles_glucemia, color='black', linestyle='-', label='Mediciones')
+        # Pintar los puntos de mediciones con colores
+        a10.scatter(hora_glucemia, niveles_glucemia, color=color_niveles, marker='o', s=30)
+        # Representar predicciones 
+            # ARIMA
+        if nueva_prediccion_arima is not None and hora_prediccion is not None:
+            a10.scatter(hora_prediccion, nueva_prediccion_arima, marker='s', color='orange', label='Predicciones ARIMA', s=20)
+            # Regression
+        if nueva_prediccion_regression is not None and hora_prediccion is not None:
+            a10.scatter(hora_prediccion, nueva_prediccion_regression, marker='s', color='pink', label='Predicciones Regresión', s=20)
+            # Random Forest
+        if nueva_prediccion_randomforest is not None and hora_prediccion is not None:
+            a10.scatter(hora_prediccion, nueva_prediccion_randomforest, marker='s', color='purple', label='Predicciones Random Forest', s=20)    
+            # RNN
+        if nueva_prediccion_rnn is not None and hora_prediccion is not None:
+            a10.scatter(hora_prediccion, nueva_prediccion_rnn, marker='s', color='yellow', label='Predicciones RNN', s=20)
+        a10.legend()
+        a10.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y %H:%M'))                   # Formatear el eje de las abscisas para mostrar las fechas completas
+        self.ventana_instancia.update_plot_predicciones()
+
+
+    # Método que representa la curva de glucosa en sangre junto con las curvas de las predicciones de los distintos modelos
+    def plot_curva_continuo_comparacion_predicciones(self):
+        if ((len(self.datos_historicos_glucosa)-self.len_datos_previos) > const_ndata_24h):     # Si hay datos de más de 24 h, coger solo datos de las últimas 24 h
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[const_ndata_24h:]
+            hora_glucemia = self.datos_historicos_glucosa.index[const_ndata_24h:]
+            nueva_prediccion_arima = self.prediccion['Prediction ARIMA next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            nueva_prediccion_regression = self.prediccion['Prediction Regression next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            nueva_prediccion_randomforest = self.prediccion['Prediction Random Forest next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            nueva_prediccion_rnn = self.prediccion['Prediction RNN next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            hora_prediccion = self.prediccion.index[const_ndata_24h:] if not self.prediccion.empty else None    
+        else:                                                                                   # si hay datos de menos de 24 h, coger todods los valores
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[self.len_datos_previos:]
+            hora_glucemia = self.datos_historicos_glucosa.index[self.len_datos_previos:]
+            nueva_prediccion_arima = self.prediccion['Prediction ARIMA next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            nueva_prediccion_regression = self.prediccion['Prediction Regression next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            nueva_prediccion_randomforest = self.prediccion['Prediction Random Forest next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            nueva_prediccion_rnn = self.prediccion['Prediction RNN next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            hora_prediccion = self.prediccion.index[self.len_datos_previos:] if not self.prediccion.empty else None
+        a11.clear()
+        a11.set_title('Curva glucemia comparación de modelos de predicción')
+        a11.set_xlabel('Día y Hora')
+        a11.set_ylabel('Nivel de glucemia(mg/dl)')
+        # Medición glucosa
+        a11.plot(hora_glucemia, niveles_glucemia, color='black', linestyle='-', label='Mediciones')
+        # Predicciones
+            # Arima
+        if nueva_prediccion_arima is not None and hora_prediccion is not None:
+            a11.plot(hora_prediccion, nueva_prediccion_arima, color='orange', linestyle='-', label='Predicciones ARIMA')
+            # Regression
+        if nueva_prediccion_regression is not None and hora_prediccion is not None:
+            a11.plot(hora_prediccion, nueva_prediccion_regression, color='pink', linestyle='-', label='Predicciones Regresión')        
+            # Random Forest
+        if nueva_prediccion_randomforest is not None and hora_prediccion is not None:
+            a11.plot(hora_prediccion, nueva_prediccion_randomforest, color='purple', linestyle='-', label='Predicciones Random Forest')        
+            # RNN
+        if nueva_prediccion_rnn is not None and hora_prediccion is not None:
+            a11.plot(hora_prediccion, nueva_prediccion_rnn, color='yellow', linestyle='-', label='Predicciones RNN')  
+        a11.legend()
+        a11.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y %H:%M'))                   # Formatear el eje de las abscisas para mostrar las fechas completas
+        self.ventana_instancia.update_plot_predicciones()
+
+
+    # Método que representa la curva de glucosa junto con las curvas de predicción ARIMA con ordenes seleccionados y orders calculados con auto_arima (comparación de las dos formas de hacer predicción ARIMA)
+    def plot_curva_continuo_comparacion_arima(self):
+        if ((len(self.datos_historicos_glucosa)-self.len_datos_previos) > const_ndata_24h):     # Si hay datos de más de 24 h, coger solo datos de las últimas 24 h
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[const_ndata_24h:]
+            hora_glucemia = self.datos_historicos_glucosa.index[const_ndata_24h:]
+            nueva_prediccion_arima = self.prediccion['Prediction ARIMA next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            nueva_prediccion_autoarima= self.prediccion['Prediction autoarima next step'].iloc[const_ndata_24h:] if not self.prediccion.empty else None
+            hora_prediccion = self.prediccion.index[const_ndata_24h:] if not self.prediccion.empty else None    
+        else:                                                                                   # si hay datos de menos de 24 h, coger todods los valores
+            niveles_glucemia = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].iloc[self.len_datos_previos:]
+            hora_glucemia = self.datos_historicos_glucosa.index[self.len_datos_previos:]
+            nueva_prediccion_arima = self.prediccion['Prediction ARIMA next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            nueva_prediccion_autoarima= self.prediccion['Prediction autoarima next step'].iloc[self.len_datos_previos:] if not self.prediccion.empty else None
+            hora_prediccion = self.prediccion.index[self.len_datos_previos:] if not self.prediccion.empty else None
+        a12.clear()
+        a12.set_title('Curva glucemia comparación de modelos de predicción ARIMA')
+        a12.set_xlabel('Día y Hora')
+        a12.set_ylabel('Nivel de glucemia(mg/dl)')
+        # Medición glucosa
+        a12.plot(hora_glucemia, niveles_glucemia, color='black', linestyle='-', label='Mediciones')
+        # Predicciones
+            # Arima
+        if nueva_prediccion_arima is not None and hora_prediccion is not None:
+            a12.plot(hora_prediccion, nueva_prediccion_arima, color='orange', linestyle='-', label='Predicciones ARIMA')
+            # Auto_arima
+        if nueva_prediccion_autoarima is not None and hora_prediccion is not None:
+            a12.plot(hora_prediccion, nueva_prediccion_autoarima, color='green', linestyle='-', label='Predicciones autoarima')     
+        a12.legend()
+        a12.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y %H:%M'))                   # Formatear el eje de las abscisas para mostrar las fechas completas
+        self.ventana_instancia.update_plot_predicciones_arima()
+
+
+    # Método de cálculo del TIR (tiempo en rango) en procentaje
+    def TIR_glucosa(self):
+        if (len(self.datos_historicos_glucosa)>288) :
+            glucosa_last24h=self.datos_historicos_glucosa.iloc[:288]['Blood Glucose (mg/dL)']
+        else:
+            glucosa_last24h=self.datos_historicos_glucosa['Blood Glucose (mg/dL)']
+        total_muestras = glucosa_last24h.size
+        # target range (70-180) / debería estar por encima del 70%
+        num_muestras_70_180 = glucosa_last24h.between(70, 180).sum()
+        self.TIR= (num_muestras_70_180 / total_muestras) * 100                                  # porcentaje de valores de glucosa que en las últimas 24h se han encontrado entre 70 y 180
+        # hipoglucemia (<70) / debería estar por debajo del 4%
+        num_muestras_menos_70 = (glucosa_last24h < 70).sum()
+        self.belowTIR=(num_muestras_menos_70 / total_muestras) * 100                            # porcentaje de valores de glucosa que en las últimas 24h se han encontrado por debajo de 70
+        # hiperglucemia (>180) / debería estar por debajo del 25%
+        num_muestras_mas_180 = (glucosa_last24h > 180).sum()
+        self.aboveTIR=(num_muestras_mas_180 / total_muestras) * 100                             # porcentaje de valores de glucosa que en las últimas 24h se han encontrado por encima de 180
+        # Imprimir resultados
+        print("Tiempo en rango (TIR) 70-180: {:.2f}%".format(self.TIR))
+        print("Tiempo en rango (TIR) <70: {:.2f}%".format(self.belowTIR))
+        print("Tiempo en rango (TIR) >180: {:.2f}%".format(self.aboveTIR))
+        self.ventana_instancia.update_start_page_text("Time in range (TIR) 70-180: {:.2f}%".format(self.TIR))
+        self.ventana_instancia.update_start_page_text("Time below range (TIR) <70: {:.2f}%".format(self.belowTIR))
+        self.ventana_instancia.update_start_page_text("Time above range (TIR) >180: {:.2f}%".format(self.aboveTIR))
+        # Añadir nuevos datos a dataframe de TIR
+        fecha_actual = self.fecha()
+        nueva_fila = pd.DataFrame([[self.TIR, self.belowTIR, self.aboveTIR]], columns=['TIR 70-180 (%)', 'TIR <70 (%)', 'TIR >180 (%)'], index=[pd.to_datetime(fecha_actual)])
+        if len(self.historico_TIR) == 0:
+            self.historico_TIR = nueva_fila
+        else:
+            self.historico_TIR = pd.concat([self.historico_TIR, nueva_fila])
+
+
+    # Método que calcula diversos valores estadísticos de la glucosa en sangre
+    def control_glucosa(self):
+        # Resumen estadístico de las medidas de glucosa
+        estadisticas_glucosa=self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].describe()
+        estadisticas_glucosa=estadisticas_glucosa.round(2)
+        print("\nEstadísticas glucosa:")
+        print(estadisticas_glucosa)
+        texto = "Estadísticas glucosa:\n" + estadisticas_glucosa.to_string()
+        self.ventana_instancia.update_start_page_text(texto, borrar=True)                       
+        # Media histórica de glucosa
+        self.media_glucosa=self.datos_historicos_glucosa['Blood Glucose (mg/dL)'].mean()
+        # TIR (time in range)
+        self.TIR_glucosa()
+        # Tendencia glucosa
+        if len(self.datos_historicos_glucosa)>len_comienzan_tendencias:
+            self.tendencia_glucosa()
+            if len(self.datos_historicos_glucosa) > len_comienza_a_predecir:
+                self.tendencia_glucosa_futura()
+        # Datos estadísticos importantes juntos
+        fecha_actual = self.fecha()
+        nueva_fila = pd.DataFrame([[self.TIR, self.belowTIR, self.aboveTIR, self.media_glucosa]], columns=['TIR 70-180 (%)', 'TIR <70 (%)', 'TIR >180 (%)', 'mean'], index=[pd.to_datetime(fecha_actual)])
+        if len(self.estadisticas) == 0: 
+            self.estadisticas = nueva_fila
+        else:
+            self.estadisticas = pd.concat([self.estadisticas, nueva_fila])
+        # Datos estadísticos a excel
+        estadisticas_copia=self.estadisticas.copy()
+        estadisticas_copia["TIR 70-180 (%)"]=estadisticas_copia["TIR 70-180 (%)"].apply(
+            lambda x: round(x, 2) if isinstance(x, float) else x
+        )
+        estadisticas_copia["TIR <70 (%)"]=estadisticas_copia["TIR <70 (%)"].apply(
+            lambda x: round(x, 2) if isinstance(x, float) else x
+        )
+        estadisticas_copia["TIR >180 (%)"]=estadisticas_copia["TIR >180 (%)"].apply(
+            lambda x: round(x, 2) if isinstance(x, float) else x
+        )
+        estadisticas_copia["mean"]=estadisticas_copia["mean"].apply(
+            lambda x: round(x, 2) if isinstance(x, float) else x
+        )
+        estadisticas_copia.to_excel('estadisticas_glucosa.xlsx', index_label='DateTime')
+
+
+    # Método saca tendencia de la glucosa en sangre (subiendo, bajando, estable) (a partir de anteriores valores ¿qué tendencia va llevando?)
+    def tendencia_glucosa(self):                                                                # A partir de los valores que ha tenido la glucosa hasta ahora (no tener en cuenta las predicciones)
+        print("\nHe entrado en tendencia_glucosa")
+        self.ventana_instancia.update_start_page_text("\nTendencia de la glucosa:")             # Sacar por pantalla la tendencia
+        i=6                                                                                     # nº de valores previos que se cogen para sacar la tendencia de la glucosa (6 valores previos, si los valores se toman cada 5 mins=últimos 30 mins)
+        ultimos_minutos = self.datos_historicos_glucosa.iloc[-i:]['Blood Glucose (mg/dL)']      # Obtener los datos de los últimos minutos
+        tiempo_minutos = np.arange(len(ultimos_minutos))                                        # Crear un array de tiempo en minutos para el eje X
+        pendiente, interseccion = np.polyfit(tiempo_minutos, ultimos_minutos, 1)                # Ajustar una línea de regresión (polinomio de grado 1) a los datos
+        # Determinar la tendencia basada en la pendiente
+        if pendiente > 0:
+            tendencia = "subiendo"
+        elif pendiente < 0:
+            tendencia = "bajando"
+        else:
+            tendencia = "estable"
+        # Imprimir la pendiente y la tendencia
+        print(f"La pendiente de la línea de regresión de los valores medidos de glucosa es {pendiente:.2f}.")
+        #print(f"La tendencia de la glucosa en los últimos minutos es... {tendencia}.")
+        print(f"La tendencia de la glucosa en los últimos segundos es... {tendencia}.")
+        #self.ventana_instancia.update_start_page_text(f"     La tendencia de la glucosa en los últimos minutos es... {tendencia}.")
+        self.ventana_instancia.update_start_page_text(f"     La tendencia de la glucosa en los últimos segundos es... {tendencia}.")
+        # Calcular el tiempo estimado para alcanzar valor_min o valor_max según la tendencia actual
+        glucosa_actual = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-1]             
+        if ((glucosa_actual>valor_min) & (glucosa_actual<valor_max)):                           # Si glucosa en rango.. calcular cuanto tardaría en salirse de rango...
+            if (pendiente>0):                                                                   # ... cuando se saldrá del rango superior (hacio hiperglucemia)
+                tiempo_hasta_valor_max = (valor_max - glucosa_actual) / pendiente
+                # Simulación
+                if tiempo_hasta_valor_max<60:
+                    tiempo_hasta_valor_max_sg = int(tiempo_hasta_valor_max)
+                    print(f"Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_sg} segundos")
+                    self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_sg} segundos")
+                else:
+                    if (tiempo_hasta_valor_max<3600):
+                        tiempo_hasta_valor_max_mins = int(tiempo_hasta_valor_max/60)
+                        tiempo_hasta_valor_max_sg = int(tiempo_hasta_valor_max % 60)
+                        print(f"Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_mins} minutos y {tiempo_hasta_valor_max_sg} segundos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_mins} minutos y {tiempo_hasta_valor_max_sg} segundos")
+                    elif (tiempo_hasta_valor_max<7200):
+                        tiempo_en_mins=tiempo_hasta_valor_max/60
+                        tiempo_hasta_valor_max_horas = int(tiempo_en_mins/60)
+                        tiempo_hasta_valor_max_mins = int(tiempo_en_mins%60)
+                        print(f"Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_horas} horas y {tiempo_hasta_valor_max_mins} minutos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_horas} horas y {tiempo_hasta_valor_max_mins} minutos")
+                    else:
+                        print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                        self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")        
+                # Para cuando 5mins
+                """
+                if tiempo_hasta_valor_max<60:
+                    tiempo_hasta_valor_max_mins = int(tiempo_hasta_valor_max)
+                    tiempo_hasta_valor_max_sg = int((tiempo_hasta_valor_max-tiempo_hasta_valor_max_mins)*60)
+                    print(f"Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_mins} minutos y {tiempo_hasta_valor_max_sg} segundos")
+                    self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_mins} minutos y {tiempo_hasta_valor_max_sg} segundos")
+                else:
+                    if (tiempo_hasta_valor_max<1440):
+                        tiempo_hasta_valor_max_horas = int(tiempo_hasta_valor_max/60)
+                        tiempo_hasta_valor_max_mins = int(tiempo_hasta_valor_max % 60)
+                        print(f"Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_horas} horas y {tiempo_hasta_valor_max_mins} minutos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_max} mg/dL: {tiempo_hasta_valor_max_horas} horas y {tiempo_hasta_valor_max_mins} minutos")
+                    else:
+                        print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                        self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                """
+            elif (pendiente<0):                                                                 # ... cuando se saldrá del rango superior (hacio hiperglucemia)
+                tiempo_hasta_valor_min = (valor_min - glucosa_actual) / pendiente
+                # Simulación
+                if tiempo_hasta_valor_min<60:
+                    tiempo_hasta_valor_min_sg = int(tiempo_hasta_valor_min)
+                    print(f"Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_sg} segundos")
+                    self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_sg} segundos")
+                else:
+                    if (tiempo_hasta_valor_min<3600):
+                        tiempo_hasta_valor_min_mins = int(tiempo_hasta_valor_min/60)
+                        tiempo_hasta_valor_min_sg = int(tiempo_hasta_valor_min % 60)
+                        print(f"Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_mins} minutos y {tiempo_hasta_valor_min_sg} segundos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_mins} minutos y {tiempo_hasta_valor_min_sg} segundos")
+                    elif (tiempo_hasta_valor_min<7200):
+                        tiempo_en_mins=tiempo_hasta_valor_min/60
+                        tiempo_hasta_valor_min_horas = int(tiempo_en_mins/60)
+                        tiempo_hasta_valor_min_mins = int(tiempo_en_mins%60)
+                        print(f"Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_horas} horas y {tiempo_hasta_valor_min_mins} minutos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_horas} horas y {tiempo_hasta_valor_min_mins} minutos")
+                    else:
+                        print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                        self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")        
+                # Para cuando 5mins
+                """
+                if tiempo_hasta_valor_min<60:
+                    tiempo_hasta_valor_min_mins = int(tiempo_hasta_valor_min)
+                    tiempo_hasta_valor_min_sg = int((tiempo_hasta_valor_min-tiempo_hasta_valor_min_mins)*60)
+                    print(f"Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_mins} minutos y {tiempo_hasta_valor_min_sg} segundos")
+                    self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_mins} minutos y {tiempo_hasta_valor_min_sg} segundos")
+                else:
+                    if (tiempo_hasta_valor_min<1440):
+                        tiempo_hasta_valor_min_horas= int(tiempo_hasta_valor_min/60)
+                        tiempo_hasta_valor_min_mins = int(tiempo_hasta_valor_min % 60)
+                        print(f"Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_horas} horas y {tiempo_hasta_valor_min_mins} minutos")
+                        self.ventana_instancia.update_start_page_text(f"     Tiempo estimado para alcanzar {valor_min} mg/dL: {tiempo_hasta_valor_min_horas} horas y {tiempo_hasta_valor_min_mins} minutos")
+                    else:
+                        print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                        self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en un tiempo próximo")
+                """    
+            else:
+                print("No se esperan alcanzar valores de glucosa fuera del rango aceptable")
+                self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable")
+        else:                                                                                   # Si glucosa ya está fuera de rango... imprimir aviso por pantalla
+            glucosa_previa=self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-2]           # Se coge el valor anterior al actual
+            if glucosa_actual<=valor_min:                                                       # Si el valor de glucosa ha sobrepasado el rango inferior  
+                if glucosa_previa>valor_min:                                                    # Si el valor anterior no estaba fuera de rango, se saca mensaje de aviso de entrando en peligro
+                    print(f"Su valor de glucosa se encuentra por debajo del límite de {valor_min} mg/dL... está entrando en hipoglucemia")
+                    self.ventana_instancia.update_start_page_text(f"\nSu valor de glucosa se encuentra por debajo del límite de {valor_min} mg/dL... está entrando en hipoglucemia")
+                if glucosa_previa<=valor_min:                                                   # Si el valor anterior también estaba fuera de rango, se saca mensaje de aviso de hipoglucemia
+                    print("Hipoglucemia")
+                    self.ventana_instancia.update_start_page_text("\nEstá sufriendo una hipoglucemia")
+            elif glucosa_actual>=valor_max:                                                     # Si el valor de glucosa ha sobrepasado el rango superior
+                if glucosa_previa<valor_max:                                                    # Si el valor anterior no estaba fuera de rango, se saca mensaje de aviso de entrando en peligro
+                    print(f"Su valor de glucosa se encuentra por encima del límite de {valor_max} mg/dL... está entrando en hiperglucemia")
+                    self.ventana_instancia.update_start_page_text(f"\nSu valor de glucosa se encuentra por encima del límite de {valor_max} mg/dL... está entrando en hiperglucemia")
+                if glucosa_previa>=valor_max:                                                   # Si el valor anterior también estaba fuera de rango, se saca mensaje de aviso de hiperglucemia
+                    print("Hiperglucemia")
+                    self.ventana_instancia.update_start_page_text("\nEstá sufriendo una hiperglucemia")
+
+
+    # Método saca tendencia esperada de la glucosa en sangre. Teniendo en cuenta valores que ha llevado hasta ahora la glucosa y los valores que se espera que lleve => Tendencia que se espera que va a llevar la glucosa    
+    def tendencia_glucosa_futura(self):                                                         
+        print("\nHe entrado en tendencia_glucosa_futura")
+        self.ventana_instancia.update_start_page_text("\nTendencia esperada de la glucosa:")
+        i=6                                                                                     # nº de valores previos de glucosa que se cogen para sacar la tendencia (si se toman valores cada 5 mins=> últimos 30 minutos)    
+        ultimos_minutos = self.datos_historicos_glucosa.iloc[-i:]['Blood Glucose (mg/dL)']      # Obtener los datos de los últimos minutos
+        proximos_minutos= self.prediccion['Prediction ARIMA next step'].iloc[-(self.steps):]    # Obtener los datos de los próximos valores de glucosa que se esperan (con ARIMA)
+        valores= pd.concat([ultimos_minutos, proximos_minutos], axis=0)                         # Se unen valores medidos y valores predichos en una variable (para sacar tendencia a futuro también)
+        print("Valores hasta ahora junto con predicciones:")
+        print(valores)
+        tiempo_minutos = np.arange(len(valores))                                                # Crear un array de tiempo en minutos para el eje X
+        pendiente, interseccion = np.polyfit(tiempo_minutos, valores, 1)                        # Ajustar una línea de regresión (polinomio de grado 1) a los datos
+        # Determinar la tendencia que se espera basada en la pendiente
+        if pendiente > 0.1:
+            tendencia = "subiendo"
+        elif pendiente < 0:
+            tendencia = "bajando"
+        else:
+            tendencia = "estable"
+        # Imprimir la pendiente y la tendencia
+        print(f"La pendiente de la línea de regresión es {pendiente:.2f}.")
+        print(f"La tendencia que se espera que siga la glucosa es... {tendencia}.")
+        self.ventana_instancia.update_start_page_text(f"     La tendencia que se espera que siga la glucosa es... {tendencia}.")
+        # Se comprueba si se espera alcanzar alguno de los valores límites
+        valor_hiperglucemico=False
+        valor_hipoglucemico=False
+        contador=0
+        contador_5m=0
+        mensaje=False
+        glucosa_actual = self.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-1]
+        if ((glucosa_actual>valor_min) & (glucosa_actual<valor_max)):
+            for valor in proximos_minutos:
+                contador+=1
+                contador_5m=contador_5m+5
+                if valor>=valor_max:
+                    valor_hipoglucemico=False
+                    if(valor_hiperglucemico):
+                        if not(mensaje):
+                            print(f"Se espera alcanzar los {valor_max} mg/dl en {contador} segundos")
+                            #print(f"Se espera alcanzar los {valor_max} mg/dl en {contador_5m} minutos")
+                            self.ventana_instancia.update_start_page_text(f"     Se espera alcanzar los {valor_max} mg/dL en {contador} segundos")
+                            #self.ventana_instancia.update_start_page_text(f"     Se espera alcanzar los {valor_max} mg/dL en {contador_5m} minutos")
+                            mensaje=True
+                    valor_hiperglucemico=True
+                elif valor<=valor_min:
+                    valor_hiperglucemico=False
+                    if(valor_hipoglucemico):
+                        if not(mensaje):
+                            print(f"Se espera alcanzar los {valor_min} mg/dl en {contador} segundos")
+                            #print(f"Se espera alcanzar los {valor_min} mg/dl en {contador_5m} minutos")
+                            self.ventana_instancia.update_start_page_text(f"     Se espera alcanzar los {valor_min} mg/dL en {contador} segundos")
+                            #self.ventana_instancia.update_start_page_text(f"     Se espera alcanzar los {valor_min} mg/dL en {contador_5m} minutos")
+                            mensaje=True
+                    valor_hipoglucemico=True
+                else:
+                    valor_hipoglucemico=False
+                    valor_hiperglucemico=False
+            if not(mensaje):
+                print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en los próximos 10 segundos")
+                #print("No se esperan alcanzar valores de glucosa fuera del rango aceptable en los próximos 50 minutos")
+                self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en los próximos 10 segundos")
+                #self.ventana_instancia.update_start_page_text("     No se esperan alcanzar valores de glucosa fuera del rango aceptable en los próximos 50 minutos")
+                mensaje=True
+
+    
+    # Método que llama a todas las funciones necesarias para llevar a cabo la medición, predicción, anális y ploteo de los gráficos
+    def update(self):
+        self.recoleccion_medicion_prediccion_datos()                                            # Recibir mediciones de glucosa y predecir
+        self.update_plots()                                                                     # Actualizar todos los plots
+        self.control_glucosa()                                                                  # Realiza análisis estadístico y de tendencias
+
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# CLASE FUZZYGLUCOSA (Lógica difusa- control emociones potato). Clase que contiene el controlador borroso
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# para cada controlador se define una funcion set_, que se ejecuta al principio para definir el controlador
+# y una funcion do_, que se ejecuta en bucle durante la duración del control
+
+class FuzzyGlucosa():
+    def __init__(self, app):
+        self.Glucosa_Luz_Alerta=None 
+        self.Alerta_Animica=None
+        self.nueva_medida_glucosa=None
+        self.luz=399.999                                                                        # Para simulación se supone luz es siempre NORMAL para poder ver el efecto de la glucosa en la alerta
+        self.animica=70                                                                         # Para simulación se supone estado anímico ALEGRE
+        self.alerta_previa=49.999                                                               # Normal (Se supone que se viene de un estado previo de alerta normal)
+        self.ventana_instancia=app                                                              # Para sacar texto por ventana Intefaz
+        self.glucosa_historial=[]                                                               # Variable para almacenar los valores de glucosa para representar gráfico glucosa alerta
+        self.alerta_historial=[]                                                                # Variable para almacenar los valores de calma para poder representar gráfico glucosa alerta
+
+
+    # Glucosa- Luz- Alerta
+    def set_Glucosa_Luz_Alerta(self):
+        # Variables de entrada y salida difusas
+        Glucosa = ctrl.Antecedent(np.linspace(0, 300, 1000), 'Glucosa')                         # creación de una variable de entrada glucosa difusa/ rango de valores de 0 a 300 (posibles valores de glucosa que se han considerado en el sistema difuso)
+        Luz = ctrl.Antecedent(np.arange(0, 1024, 1), 'Luz')
+        Alerta = ctrl.Consequent(np.arange(0, 101, 1), 'Alerta')
+        AlertaIn = ctrl.Antecedent(np.arange(0, 101, 1), 'AlertaIn') 
+        # GLUCOSA
+        # Definir las funciones de membresía para glucosa
+        Glucosa['muy_bajo'] = fuzz.trapmf(Glucosa.universe, [0, 0, 40, 60])
+        Glucosa['bajo'] = fuzz.trimf(Glucosa.universe, [40, 57, 75])
+        Glucosa['normal'] = fuzz.trapmf(Glucosa.universe, [60, 80, 120, 170])
+        Glucosa['alto'] = fuzz.trimf(Glucosa.universe, [150, 175, 200])
+        Glucosa['muy_alto'] = fuzz.trapmf(Glucosa.universe, [170, 240, 300, 300])
+        # LUZ
+        # Definir las funciones de membresía para luz
+        Luz['MOSCURO'] = fuzz.trapmf(Luz.universe, [0, 0, 100, 200])
+        Luz['OSCURO'] = fuzz.trimf(Luz.universe, [100, 200, 400])
+        Luz['NORMAL'] = fuzz.trimf(Luz.universe, [200, 400, 700])
+        Luz['CLARO'] = fuzz.trimf(Luz.universe, [400, 700, 900])
+        Luz['MCLARO'] = fuzz.trapmf(Luz.universe, [700, 900, 1023, 1023])
+        # ALERTA
+        # Definir las funciones de membresía para alerta
+        Alerta['MIEDO'] = fuzz.trapmf(Alerta.universe, [50, 75, 100, 100])
+        Alerta['NORMAL'] = fuzz.trimf(Alerta.universe, [25, 50, 75])
+        Alerta['CALMA'] = fuzz.trapmf(Alerta.universe, [0, 0, 25, 50])
+        # ALERTA Input (Alerta previa)
+        # Definir las funciones de membresía de alerta input
+        AlertaIn['CALMA'] = fuzz.trapmf(np.arange(0, 101, 1), [0, 0, 25, 50])
+        AlertaIn['NORMAL'] = fuzz.trimf(np.arange(0, 101, 1), [25, 50, 75])
+        AlertaIn['MIEDO'] = fuzz.trapmf(np.arange(0, 101, 1), [50, 75, 100, 100])
+        # REGLAS
+        # Definir las reglas difusas
+        # Para Luz CLARA o MUY CLARA Y Luz NORMAL
+        rule1 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['CALMA'], Alerta['NORMAL'])
+        rule2 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['NORMAL'], Alerta['MIEDO'])
+        rule3 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule4 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['CALMA'], Alerta['CALMA'])
+        rule5 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['NORMAL'], Alerta['NORMAL'])
+        rule6 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO'] | Luz['NORMAL']) & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule7 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO']) & Glucosa['normal'] & AlertaIn['CALMA'], Alerta['CALMA'])
+        rule8 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO']) & Glucosa['normal'] & AlertaIn['NORMAL'], Alerta['CALMA'])
+        rule9 = ctrl.Rule((Luz['CLARO'] | Luz['MCLARO']) & Glucosa['normal'] & AlertaIn['MIEDO'], Alerta['CALMA'])
+        rule10 = ctrl.Rule(Luz['NORMAL'] & Glucosa['normal'] & AlertaIn['CALMA'], Alerta['CALMA'])
+        rule11 = ctrl.Rule(Luz['NORMAL'] & Glucosa['normal'] & AlertaIn['NORMAL'], Alerta['CALMA'])
+        rule12 = ctrl.Rule(Luz['NORMAL'] & Glucosa['normal'] & AlertaIn['MIEDO'], Alerta['NORMAL'])
+        # Para Luz OSCURA
+        rule13 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['CALMA'], Alerta['NORMAL'])
+        rule14 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['NORMAL'], Alerta['MIEDO'])
+        rule15 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule16 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['CALMA'], Alerta['NORMAL'])
+        rule17 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['NORMAL'], Alerta['NORMAL'])
+        rule18 = ctrl.Rule(Luz['OSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule19 = ctrl.Rule(Luz['OSCURO'] & Glucosa['normal'] & AlertaIn['CALMA'], Alerta['CALMA'])
+        rule20 = ctrl.Rule(Luz['OSCURO'] & Glucosa['normal'] & AlertaIn['NORMAL'], Alerta['NORMAL'])
+        rule21 = ctrl.Rule(Luz['OSCURO'] & Glucosa['normal'] & AlertaIn['MIEDO'], Alerta['NORMAL'])
+        # Para Luz MUY OSCURA
+        rule22 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['CALMA'], Alerta['MIEDO'])
+        rule23 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['NORMAL'], Alerta['MIEDO'])
+        rule24 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['muy_bajo'] | Glucosa['muy_alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule25 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['CALMA'], Alerta['NORMAL'])
+        rule26 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['NORMAL'], Alerta['MIEDO'])
+        rule27 = ctrl.Rule(Luz['MOSCURO'] & (Glucosa['bajo'] | Glucosa['alto']) & AlertaIn['MIEDO'], Alerta['MIEDO'])
+        rule28 = ctrl.Rule(Luz['MOSCURO'] & Glucosa['normal'] & AlertaIn['CALMA'], Alerta['NORMAL'])
+        rule29 = ctrl.Rule(Luz['MOSCURO'] & Glucosa['normal'] & AlertaIn['NORMAL'], Alerta['NORMAL'])
+        rule30 = ctrl.Rule(Luz['MOSCURO'] & Glucosa['normal'] & AlertaIn['MIEDO'], Alerta['NORMAL'])
+        # CONTROLADOR GLUCOSA-ALERTA
+        # Crear el sistema de control difuso
+        Glucosa_Luz_Alerta_ctrl = ctrl.ControlSystem([rule1, rule2, rule3, rule4, rule5, rule6, rule7, rule8, rule9, rule10, rule11, rule12, rule13, rule14, rule15, rule16, rule17, rule18, rule19, rule20, rule21, rule22, rule23, rule24, rule25, rule26, rule27, rule28, rule29, rule30])
+        # Crear la simulación del sistema difuso
+        Glucosa_Luz_Alerta = ctrl.ControlSystemSimulation(Glucosa_Luz_Alerta_ctrl)
+        # Ingresar valores (inputs) de glucosa, luz y alerta previa
+        Glucosa_Luz_Alerta.input['Glucosa'] = self.nueva_medida_glucosa
+        Glucosa_Luz_Alerta.input['Luz']=self.luz
+        Glucosa_Luz_Alerta.input['AlertaIn']= self.alerta_previa
+        # Ejecutar la simulación
+        Glucosa_Luz_Alerta.compute()
+        self.Glucosa_Luz_Alerta=Glucosa_Luz_Alerta
+        return 1
+
+    def do_Glucosa_Luz_Alerta(self):
+        if self.Glucosa_Luz_Alerta==None:
+            self.set_Glucosa_Luz_Alerta()
+        Glucosa_Luz_Alerta=self.Glucosa_Luz_Alerta
+        # Ingresar valores (inputs) de glucosa, luz y alerta previa
+        Glucosa_Luz_Alerta.input['Glucosa']=self.nueva_medida_glucosa
+        Glucosa_Luz_Alerta.input['Luz']=self.luz
+        self.alerta_previa = Glucosa_Luz_Alerta.output['Alerta']
+        Glucosa_Luz_Alerta.input['AlertaIn']= self.alerta_previa
+        # Ejecutar la simulación
+        Glucosa_Luz_Alerta.compute()
+        # Almacenar valores para el gráfico
+        self.glucosa_historial.append(self.nueva_medida_glucosa)
+        self.alerta_historial.append(Glucosa_Luz_Alerta.output['Alerta'])
+        # Obtener las pertenencias en cada conjunto difuso de alerta (ver en qué nivel de alerta se está)
+        alerta_universe = np.linspace(0, 100, 1000)
+        pertenencias = {
+            'MIEDO': fuzz.interp_membership(alerta_universe, fuzz.trapmf(alerta_universe, [50, 75, 100, 100]), Glucosa_Luz_Alerta.output['Alerta']),
+            'NORMAL': fuzz.interp_membership(alerta_universe, fuzz.trimf(alerta_universe, [25, 50, 75]), Glucosa_Luz_Alerta.output['Alerta']),
+            'CALMA': fuzz.interp_membership(alerta_universe, fuzz.trapmf(alerta_universe, [0, 0, 25, 50]), Glucosa_Luz_Alerta.output['Alerta'])
+        }
+        # Obtener las pertenencias en cada conjunto difuso de alerta (ver de qué nivel de alerta previo se viene)
+        pertenencias1 = {
+            'MIEDO': fuzz.interp_membership(alerta_universe, fuzz.trapmf(alerta_universe, [50, 75, 100, 100]), self.alerta_previa),
+            'NORMAL': fuzz.interp_membership(alerta_universe, fuzz.trimf(alerta_universe, [25, 50, 75]), self.alerta_previa),
+            'CALMA': fuzz.interp_membership(alerta_universe, fuzz.trapmf(alerta_universe, [0, 0, 25, 50]), self.alerta_previa)
+        }
+        # Obtener las pertenencias en cada conjunto difuso de glucosa (ver en qué nivel de glucosa se está)
+        glucosa_universe = np.linspace(0, 300, 1000)
+        pertenencias2 ={
+            'muy_bajo': fuzz.interp_membership(glucosa_universe,fuzz.trapmf(glucosa_universe, [0, 0, 40, 60]),self.nueva_medida_glucosa),
+            'bajo': fuzz.interp_membership(glucosa_universe,fuzz.trimf(glucosa_universe, [40, 57, 75]),self.nueva_medida_glucosa),
+            'normal': fuzz.interp_membership(glucosa_universe,fuzz.trapmf(glucosa_universe, [60, 80, 120, 170]),self.nueva_medida_glucosa),
+            'alto': fuzz.interp_membership(glucosa_universe,fuzz.trimf(glucosa_universe, [150, 175, 200]),self.nueva_medida_glucosa),
+            'muy_alto': fuzz.interp_membership(glucosa_universe,fuzz.trapmf(glucosa_universe, [170, 240, 300, 300]),self.nueva_medida_glucosa)
+        }
+        # Último valor de glucosa medido
+        print("\nEl último valor de glucosa medido es:", self.nueva_medida_glucosa)
+        print(pertenencias2)
+        nivel_glucosa=self.get_nivel_glucosa(pertenencias2)
+        print("El nivel de glucosa es:", nivel_glucosa)
+        self.ventana_instancia.update_start_page_text(f"\nEl nivel de glucosa actual es {nivel_glucosa}")
+        # Estado de alerta previo
+        print(f"La alerta previa es:{self.alerta_previa:.2f}")
+        print(pertenencias1)
+        estado_alerta_previo= self.get_estado_alerta(pertenencias1)
+        print ("El nivel de alerta previo es:", estado_alerta_previo)
+        # Obtener el valor de alerta
+        valor_alerta =  Glucosa_Luz_Alerta.output['Alerta']
+        print(f"La alerta de de potato es:{valor_alerta:.2f}")
+        print(pertenencias)
+        estado_alerta = self.get_estado_alerta(pertenencias)
+        print("El estado de alerta de potato es:", estado_alerta)
+        self.ventana_instancia.update_estado_alarma(f"\nEl estado de alerta de POTATO es: {estado_alerta}\n\n")
+        self.Glucosa_Luz_Alerta=Glucosa_Luz_Alerta
+
+    
+    # Alerta-Anímica-Estado General
+    def set_Alerta_Animica(self):
+        # Variables de entrada y salida difusas
+        EstadoGen = ctrl.Consequent(np.arange(0, 101, 1), 'EstadoGen')
+        AnimicaIn = ctrl.Antecedent(np.arange(0, 121, 1), 'AnimicaIn')
+        AlertaIn = ctrl.Antecedent(np.arange(0, 101, 1), 'AlertaIn')
+        # ALERTA Input
+        # Definir las funciones de membresía para alerta input
+        AlertaIn['CALMA'] = fuzz.trapmf(np.arange(0, 101, 1), [0, 0, 25, 50])
+        AlertaIn['NORMAL'] = fuzz.trimf(np.arange(0, 101, 1), [25, 50, 75])
+        AlertaIn['MIEDO'] = fuzz.trapmf(np.arange(0, 101, 1), [50, 75, 100, 100])
+        # ANÍMICA
+        # Definir las funciones de membresía de estado anímico
+        AnimicaIn['MTRISTE'] = fuzz.trapmf(np.arange(0, 121, 1), [0, 0, 15, 30])
+        AnimicaIn['TRISTE'] = fuzz.trimf(np.arange(0, 121, 1), [15, 30, 45])
+        AnimicaIn['NORMAL'] = fuzz.trimf(np.arange(0, 121, 1), [30, 45, 80])
+        AnimicaIn['ALEGRE'] = fuzz.trimf(np.arange(0, 121, 1), [60, 80, 100])
+        AnimicaIn['MALEGRE'] = fuzz.trapmf(np.arange(0, 121, 1), [80, 100, 120, 120])
+        # ESTADO GENERAL
+        # Definir las funciones de membresía de estado general
+        EstadoGen['MIEDO'] = fuzz.trapmf(np.arange(0, 101, 1), [0, 0, 20, 40])
+        EstadoGen['NORMAL'] = fuzz.trimf(np.arange(0, 101, 1), [20, 40, 60])
+        EstadoGen['ALEGRE'] = fuzz.trimf(np.arange(0, 101, 1), [40, 60, 80])
+        EstadoGen['ALEGRECAL'] = fuzz.trapmf(np.arange(0, 101, 1), [60, 80, 100, 100])
+        # REGLAS
+        # Definir las reglas difusas
+        rule1 = ctrl.Rule(AlertaIn['CALMA'] & AnimicaIn['MTRISTE'], EstadoGen['NORMAL'])
+        rule2 = ctrl.Rule(AlertaIn['CALMA'] & AnimicaIn['TRISTE'], EstadoGen['NORMAL'])
+        rule3 = ctrl.Rule(AlertaIn['CALMA'] & AnimicaIn['NORMAL'], EstadoGen['NORMAL'])
+        rule4 = ctrl.Rule(AlertaIn['CALMA'] & AnimicaIn['ALEGRE'], EstadoGen['ALEGRE'])
+        rule5 = ctrl.Rule(AlertaIn['CALMA'] & AnimicaIn['MALEGRE'], EstadoGen['ALEGRECAL'])
+        rule6 = ctrl.Rule(AlertaIn['NORMAL'] & AnimicaIn['MTRISTE'], EstadoGen['NORMAL'])
+        rule7 = ctrl.Rule(AlertaIn['NORMAL'] & AnimicaIn['TRISTE'], EstadoGen['NORMAL'])
+        rule8 = ctrl.Rule(AlertaIn['NORMAL'] & AnimicaIn['NORMAL'], EstadoGen['NORMAL'])
+        rule9 = ctrl.Rule(AlertaIn['NORMAL'] & AnimicaIn['ALEGRE'], EstadoGen['NORMAL'])
+        rule10 = ctrl.Rule(AlertaIn['NORMAL'] & AnimicaIn['MALEGRE'], EstadoGen['ALEGRE'])
+        rule11 = ctrl.Rule(AlertaIn['MIEDO'] & AnimicaIn['MTRISTE'], EstadoGen['MIEDO'])
+        rule12 = ctrl.Rule(AlertaIn['MIEDO'] & AnimicaIn['TRISTE'], EstadoGen['MIEDO'])
+        rule13 = ctrl.Rule(AlertaIn['MIEDO'] & AnimicaIn['NORMAL'], EstadoGen['MIEDO'])
+        rule14 = ctrl.Rule(AlertaIn['MIEDO'] & AnimicaIn['ALEGRE'], EstadoGen['MIEDO'])
+        rule15 = ctrl.Rule(AlertaIn['MIEDO'] & AnimicaIn['MALEGRE'], EstadoGen['MIEDO'])
+        #CONTROLADOR ALERTA-ANIMICA
+        # Crear el sistema de control difuso
+        Alerta_Animica_ctrl = ctrl.ControlSystem([rule1, rule2, rule3, rule4, rule5, rule6, rule7, rule8, rule9, rule10, rule11, rule12, rule13, rule14, rule15])
+        # Crear la simulación del sistema difuso
+        Alerta_Animica = ctrl.ControlSystemSimulation(Alerta_Animica_ctrl)
+        # Ingresar valores (inputs) de alerta y anímica
+        Alerta_Animica.input['AnimicaIn'] = self.animica
+        Alerta_Animica.input['AlertaIn'] = self.alerta_previa
+        # Ejecutar la simulación
+        Alerta_Animica.compute()
+        self.Alerta_Animica=Alerta_Animica
+    
+    def do_Alerta_Animica(self):
+        if self.Alerta_Animica == None:
+            self.set_Alerta_Animica()
+        Alerta_Animica=self.Alerta_Animica
+        # Ingresar valores (inputs) de alerta y anímica
+        Alerta_Animica.input['AnimicaIn'] = self.animica
+        Alerta_Animica.input['AlertaIn'] = self.alerta_previa
+        # Ejecutar la simulación
+        Alerta_Animica.compute()
+        # Obtener las pertenencias en cada conjunto difuso de estado general (ver en qué estado general se ha entrado)
+        estadogen_universe = np.linspace(0, 100, 1000)
+        pertenencias = {
+            'MIEDO': fuzz.interp_membership(estadogen_universe, fuzz.trapmf(estadogen_universe, [0, 0, 20, 40]), Alerta_Animica.output['EstadoGen']),
+            'NORMAL': fuzz.interp_membership(estadogen_universe, fuzz.trimf(estadogen_universe, [20, 40, 60]), Alerta_Animica.output['EstadoGen']),
+            'ALEGRE': fuzz.interp_membership(estadogen_universe, fuzz.trimf(estadogen_universe, [40, 60, 80]), Alerta_Animica.output['EstadoGen']),
+            'ALEGRECAL': fuzz.interp_membership(estadogen_universe, fuzz.trapmf(estadogen_universe, [60, 80, 100, 100]), Alerta_Animica.output['EstadoGen'])
+        }
+        # Obtener las pertenencias en cada conjunto difuso de anímica (nivel anímico)
+        animica_universe= np.linspace(0, 120, 1000)
+        pertenencias2 = {
+            'MTRISTE':fuzz.interp_membership(animica_universe,fuzz.trapmf(animica_universe, [0, 0, 15, 30]), self.animica),
+            'TRISTE':fuzz.interp_membership(animica_universe,fuzz.trimf(animica_universe, [15, 30, 45]), self.animica),
+            'NORMAL':fuzz.interp_membership(animica_universe,fuzz.trimf(animica_universe, [30, 45, 80]), self.animica),
+            'ALEGRE':fuzz.interp_membership(animica_universe,fuzz.trimf(animica_universe, [60, 80, 100]), self.animica),
+            'MALEGRE':fuzz.interp_membership(animica_universe,fuzz.trapmf(animica_universe,[80, 100, 120, 120]), self.animica),
+        }
+        # Estado anímico
+        print("El estado animico previo de potato es:", self.animica)
+        print(pertenencias2)
+        estado_animicop=self.get_estado_animico(pertenencias2)
+        print("El estado anímico previo de potato es:", estado_animicop)
+        # Determinar el estado general
+        print("El estado general de potato es:", Alerta_Animica.output['EstadoGen'])
+        print(pertenencias)
+        estado_general = self.get_estado_general(pertenencias)
+        self.ventana_instancia.actualizar_pageone(estado_general)
+        print("El estado general de potato es:", estado_general)
+        self.Alerta_Animica=Alerta_Animica
+
+
+    # Determinar el estado de alerta basándose en las pertenencias
+    def get_estado_alerta(self,pertenencias):
+        if pertenencias['MIEDO'] > pertenencias['NORMAL'] and pertenencias['MIEDO'] > pertenencias['CALMA']:
+            return 'MIEDO'
+        elif pertenencias['NORMAL'] > pertenencias['CALMA']:
+            return 'NORMAL'
+        else:
+            return 'CALMA'
+
+    # Determinar el estado de glucosa basándose en pertenencias
+    def get_nivel_glucosa(self, pertenencias):
+        if pertenencias['muy_bajo'] > pertenencias['bajo'] and pertenencias['muy_bajo'] > pertenencias['normal'] and pertenencias['muy_bajo']>pertenencias['alto'] and pertenencias['muy_bajo']>pertenencias['muy_alto']:
+            return 'muy_bajo'
+        elif pertenencias['bajo'] > pertenencias['normal'] and pertenencias['bajo']>pertenencias['alto'] and pertenencias['bajo']>pertenencias['muy_alto']:
+            return 'bajo'
+        elif pertenencias['normal']>pertenencias['alto'] and pertenencias['normal']>pertenencias['muy_alto']:
+            return 'normal'
+        elif pertenencias['alto']>pertenencias['muy_alto']:
+            return 'alto'
+        else:
+            return 'muy_alto'
+    
+    # Determinar el estado general basándose en pertenencias
+    def get_estado_general(self,pertenencias):
+        if pertenencias['MIEDO'] > pertenencias['NORMAL'] and pertenencias['MIEDO'] > pertenencias['ALEGRE'] and pertenencias['MIEDO']>pertenencias['ALEGRECAL']:
+            return 'MIEDO'
+        elif pertenencias['NORMAL'] > pertenencias['ALEGRE'] and pertenencias['NORMAL']>pertenencias['ALEGRECAL']:
+            return 'NORMAL'
+        elif pertenencias['ALEGRE']>pertenencias['ALEGRECAL']:
+            return 'ALEGRE'
+        else:
+            return 'ALEGRECAL'
+
+    # Determinar el estado anímico basándose en pertenencias
+    def get_estado_animico(self, pertenencias):
+        if pertenencias['MTRISTE'] > pertenencias['TRISTE'] and pertenencias['MTRISTE'] > pertenencias['NORMAL'] and pertenencias['MTRISTE']>pertenencias['ALEGRE'] and pertenencias['MTRISTE']>pertenencias['MALEGRE']:
+            return 'MTRISTE'
+        elif pertenencias['TRISTE'] > pertenencias['NORMAL'] and pertenencias['TRISTE'] > pertenencias['ALEGRE'] and pertenencias['TRISTE']>pertenencias['MALEGRE']:
+            return 'TRISTE'
+        elif pertenencias['NORMAL']>pertenencias['ALEGRE'] and pertenencias['NORMAL']>pertenencias['MALEGRE']:
+            return 'NORMAL'
+        elif pertenencias['ALEGRE']>pertenencias['MALEGRE']:
+            return 'ALEGRE'
+        else:
+            return 'MALEGRE'
+
+
+    # Función do_fuzzy
+    def do_fuzzy(self):
+        self.do_Glucosa_Luz_Alerta()
+        self.do_Alerta_Animica()
+        self.plot_glucosa_alerta()
+
+
+    # Representación de las funciones de pertenencia de Glucosa, Luz, Alerta, Animica, Estado General
+    def plot_funciones_pertenencia(self):
+        self.plot_funcion_pertenencia_glucosa()
+        self.plot_funcion_pertenencia_luz()
+        self.plot_funcion_pertenencia_alerta()
+        self.plot_funcion_pertenencia_animica()
+        self.plot_funcion_pertenencia_estadogeneral()
+
+    # Método representa la función de pertenencia de la Glucosa
+    def plot_funcion_pertenencia_glucosa(self):
+        Glucosa = ctrl.Antecedent(np.linspace(0, 300, 1000), 'Glucosa')
+        # Definir las funciones de membresía para glucosa
+        Glucosa['muy_bajo'] = fuzz.trapmf(Glucosa.universe, [0, 0, 40, 60])
+        Glucosa['bajo'] = fuzz.trimf(Glucosa.universe, [40, 57, 75])
+        Glucosa['normal'] = fuzz.trapmf(Glucosa.universe, [60, 80, 120, 170])
+        Glucosa['alto'] = fuzz.trimf(Glucosa.universe, [150, 175, 200])
+        Glucosa['muy_alto'] = fuzz.trapmf(Glucosa.universe, [170, 240, 300, 300])
+        # Visualización de las funciones de pertenencia de glucosa
+        a2.plot(Glucosa.universe, fuzz.trapmf(Glucosa.universe, [0, 0, 40, 60]), label='Muy Baja', color='red')
+        a2.plot(Glucosa.universe, fuzz.trimf(Glucosa.universe, [40, 57, 75]), label='Baja', color='orange')
+        a2.plot(Glucosa.universe, fuzz.trapmf(Glucosa.universe, [60, 80, 120, 170]), label='Normal', color='green')
+        a2.plot(Glucosa.universe, fuzz.trimf(Glucosa.universe, [150, 175, 200]), label='Alta', color='yellow')
+        a2.plot(Glucosa.universe, fuzz.trapmf(Glucosa.universe, [170, 240, 300, 300]), label='Muy Alta', color='purple')
+        a2.set_xlabel('Glucosa')
+        a2.set_ylabel('Pertenencia')
+        a2.legend()
+
+    # Método representa la función de pertenencia de la Luz
+    def plot_funcion_pertenencia_luz(self):
+        Luz = ctrl.Antecedent(np.arange(0, 1024, 1), 'Luz')
+        # Definir las funciones de membresía para luz
+        Luz['MOSCURO'] = fuzz.trapmf(Luz.universe, [0, 0, 100, 200])
+        Luz['OSCURO'] = fuzz.trimf(Luz.universe, [100, 200, 400])
+        Luz['NORMAL'] = fuzz.trimf(Luz.universe, [200, 400, 700])
+        Luz['CLARO'] = fuzz.trimf(Luz.universe, [400, 700, 900])
+        Luz['MCLARO'] = fuzz.trapmf(Luz.universe, [700, 900, 1023, 1023])
+        # Visualización de las funciones de pertenencia de glucosa
+        a3.plot(Luz.universe, fuzz.trapmf(Luz.universe, [0, 0, 100, 200]), label='Muy oscuro', color='red')
+        a3.plot(Luz.universe, fuzz.trimf(Luz.universe, [100, 200, 400]), label='Oscuro', color='purple')
+        a3.plot(Luz.universe, fuzz.trimf(Luz.universe, [200, 400, 700]), label='Normal', color='green')
+        a3.plot(Luz.universe, fuzz.trimf(Luz.universe, [400, 700, 900]), label='Claro', color='orange')
+        a3.plot(Luz.universe, fuzz.trapmf(Luz.universe, [700, 900, 1023, 1023]), label='Muy claro', color='yellow')
+        a3.set_xlabel('Luz')
+        a3.set_ylabel('Pertenencia')
+        a3.legend()
+
+    # Método representa la función de pertenencia de Alerta
+    def plot_funcion_pertenencia_alerta(self):
+        Alerta = ctrl.Consequent(np.arange(0, 101, 1), 'Alerta') 
+        # Definir las funciones de membresía para alerta
+        Alerta['MIEDO'] = fuzz.trapmf(Alerta.universe, [50, 75, 100, 100])
+        Alerta['NORMAL'] = fuzz.trimf(Alerta.universe, [25, 50, 75])
+        Alerta['CALMA'] = fuzz.trapmf(Alerta.universe, [0, 0, 25, 50])
+        # Visualización de las funciones de pertenencia de alerta
+        a4.plot(Alerta.universe, fuzz.trapmf(Alerta.universe, [50, 75, 100, 100]), label='Miedo', color='red')
+        a4.plot(Alerta.universe, fuzz.trimf(Alerta.universe, [25, 50, 75]), label='Normal', color='blue')
+        a4.plot(Alerta.universe, fuzz.trapmf(Alerta.universe, [0, 0, 25, 50]), label='Calma', color='green')
+        a4.set_xlabel('Alerta')
+        a4.set_ylabel('Pertenencia')
+        a4.legend()
+
+    # Método representa la función de pertenencia de Anímica
+    def plot_funcion_pertenencia_animica(self):
+        AnimicaIn = ctrl.Antecedent(np.arange(0, 121, 1), 'AnimicaIn')
+        # Definir las funciones de membresía para alerta
+        AnimicaIn['MTRISTE'] = fuzz.trapmf(AnimicaIn.universe, [0, 0, 15, 30])
+        AnimicaIn['TRISTE'] = fuzz.trimf(AnimicaIn.universe, [15, 30, 45])
+        AnimicaIn['NORMAL'] = fuzz.trimf(AnimicaIn.universe, [30, 45, 80])
+        AnimicaIn['ALEGRE'] = fuzz.trimf(AnimicaIn.universe, [60, 80, 100])
+        AnimicaIn['MALEGRE'] = fuzz.trapmf(AnimicaIn.universe, [80, 100, 120, 120])
+        # Visualización de las funciones de pertenencia de alerta
+        a5.plot(AnimicaIn.universe, fuzz.trapmf(AnimicaIn.universe, [0, 0, 15, 30]), label='Muy triste', color='red')
+        a5.plot(AnimicaIn.universe, fuzz.trimf(AnimicaIn.universe, [15, 30, 45]), label='Triste', color='blue')
+        a5.plot(AnimicaIn.universe, fuzz.trimf(AnimicaIn.universe, [30, 45, 80]), label='Normal', color='green')
+        a5.plot(AnimicaIn.universe, fuzz.trimf(AnimicaIn.universe, [60, 80, 100]), label='Alegre', color='orange')
+        a5.plot(AnimicaIn.universe, fuzz.trapmf(AnimicaIn.universe, [80, 100, 120, 120]), label='Muy Alegre', color='yellow')
+        a5.set_xlabel('Anímica')
+        a5.set_ylabel('Pertenencia')
+        a5.legend()
+
+    # Método representa la función de pertenencia de Estado General
+    def plot_funcion_pertenencia_estadogeneral(self):
+        EstadoGen = ctrl.Consequent(np.arange(0, 101, 1), 'EstadoGen')
+        # Definir las funciones de membresía para estado general
+        EstadoGen['MIEDO'] = fuzz.trapmf(EstadoGen.universe, [0, 0, 20, 40])#Cambio 0,0,10,20
+        EstadoGen['NORMAL'] = fuzz.trimf(EstadoGen.universe, [20, 40, 60])
+        EstadoGen['ALEGRE'] = fuzz.trimf(EstadoGen.universe, [40, 60, 80])
+        EstadoGen['ALEGRECAL'] = fuzz.trapmf(EstadoGen.universe, [60, 80, 100, 100])
+        # Visualización de las funciones de pertenencia de alerta
+        a6.plot(EstadoGen.universe, fuzz.trapmf(EstadoGen.universe, [0, 0, 20, 40]), label='Miedo', color='red')
+        a6.plot(EstadoGen.universe, fuzz.trimf(EstadoGen.universe, [20, 40, 60]), label='Normal', color='blue')
+        a6.plot(EstadoGen.universe, fuzz.trimf(EstadoGen.universe, [40, 60, 80]), label='Alegre', color='green')
+        a6.plot(EstadoGen.universe, fuzz.trapmf(EstadoGen.universe, [60, 80, 100, 100]), label='Alegre Calmado', color='orange')
+        a6.set_xlabel('Estado general')
+        a6.set_ylabel('Pertenencia')
+        a6.legend()
+
+
+    # Método para representar la evolución de la alerta según la evolución de la glucosa
+    def plot_glucosa_alerta(self): # Para valor de luz cte = al de simulación (luz normal)
+        a9.clear()
+        a9_2.clear()
+        a9.plot(self.glucosa_historial, label='Glucosa', color='purple')
+        a9_2.plot(self.alerta_historial, label='Alerta', color='blue')
+        a9.set_xlabel('Evolución temporal')
+        a9.set_xticklabels([])
+        a9.legend(loc='upper left')
+        a9_2.legend(loc='upper right')
+        self.ventana_instancia.update_plot_fuzzy()
+
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# INTERFAZ Control glucosa (tkinter)
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+class Ventana(tk.Tk):
+    def __init__(self, *args, **kwargs):
+        tk.Tk.__init__(self, *args, **kwargs)
+        tk.Tk.wm_title(self, "Interfaz control de glucosa")
+       
+        self.fuzzy_estado_general=None
+
+        #  Obtener el ancho y alto de la pantalla
+        self.screen_width = self.winfo_screenwidth()
+        self.screen_height = self.winfo_screenheight()
+        # Establecer el tamaño de la ventana para que ocupe toda la pantalla
+        self.geometry(f"{self.screen_width}x{self.screen_height}+0+0")
+
+        container = ttk.Frame(self)
+        container.pack(side="top", fill="both", expand=True)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self.frames = {}
+        for F in (StartPage, PageOne):
+            frame = F(container, self)
+            self.frames[F] = frame
+            frame.grid(row=0, column=0, sticky="nsew")
+        self.show_frame(StartPage)
+
+    def show_frame(self, cont):
+        frame = self.frames[cont]
+        frame.tkraise()
+    
+    # Método para agregar texto al cuadro de texto de la tab1 de StartPage
+    def update_start_page_text(self, texto, borrar=False):
+        start_page=self.frames[StartPage]
+        start_page.agregar_texto(texto, borrar)
+
+    # Método para actualizar el cuadro de texto del estado de alarma de la tab1 de StartPage
+    def update_estado_alarma(self, estado_alarma):
+        start_page=self.frames[StartPage]
+        start_page.actualizar_estado_alarma(estado_alarma)
+
+    # Método para actualizar pageone que muestra cara de POTATO de PageOne
+    def actualizar_pageone(self, nuevo_estado):
+        self.fuzzy_estado_general=nuevo_estado
+        page_one=self.frames[PageOne]
+        page_one.actualizar_imagen_y_texto_segun_estado(nuevo_estado)
+
+    # Método para actualizar los gráficos de ARIMA (acf, pacf)
+    def update_plot_ARIMA(self):
+        start_page=self.frames[StartPage]
+        start_page.actualizar_plot_ARIMA()
+    
+    # Método para actualizar gráficos de comparación de métodos de predicción
+    def update_plot_predicciones(self):
+        start_page=self.frames[StartPage]
+        start_page.actualizar_plot_predicciones()
+
+    # Método para actualizar gráfico para comparar arima con parámetros seleccionados y sacados con auto_arima
+    def update_plot_predicciones_arima(self):
+        start_page=self.frames[StartPage]
+        start_page.actualizar_plot_predicciones_arima()
+    
+    # Método para representar las funciones de pertenencia (lógica difusa)
+    def update_plot_fuzzy(self):
+        start_page=self.frames[StartPage]
+        start_page.actualizar_plot_fuzzy()
+
+
+
+class StartPage(ttk.Frame):
+    def __init__(self, parent, controller):
+        ttk.Frame.__init__(self, parent)
+        label = ttk.Label(self, text="Control evolución de glucosa en sangre", font=LARGE_FONT)
+        label.pack(pady=0, padx=10)
+
+        # Creación de pestañas en StartPage
+        tab_control = ttk.Notebook(self)
+        tab1 = ttk.Frame(tab_control)
+        tab2 = ttk.Frame(tab_control)
+        tab3 = ttk.Frame(tab_control)
+        tab4 = ttk.Frame(tab_control)
+        tab5 = ttk.Frame(tab_control)
+        tab6 = ttk.Frame(tab_control)
+        tab_control.add(tab1, text="Control glucosa en sangre")
+        tab_control.add(tab2, text="Funciones de pertenencia variables difusas")
+        tab_control.add(tab3, text="Evolución Glucosa-Alerta")
+        tab_control.add(tab4, text="ARIMA")
+        tab_control.add(tab5, text="Curva de glucosa con comparación de predicciones ARIMA")
+        tab_control.add(tab6, text="Curva de glucosa con comparación de predicciones")
+        tab_control.pack(fill="both", expand=True)
+
+        # TAB 1: 
+        tab1.grid_rowconfigure(0, weight=4)
+        tab1.grid_rowconfigure(1, weight=1)
+        tab1.grid_columnconfigure(0, weight=1)
+        # Gráfico actualizable...
+        frame1=tk.Frame(tab1)
+        frame1.grid(row=0, column=0, sticky="nsew")
+        canvas1 = FigureCanvasTkAgg(f1, frame1)
+        canvas1.get_tk_widget().pack(side="top", fill=tk.BOTH, expand=True)
+        toolbar1=NavigationToolbar2Tk(canvas1, frame1, pack_toolbar=False)
+        toolbar1.update()
+        toolbar1.pack()
+        #... y cuadro de texto inferior
+        frame2=tk.Frame(tab1)
+        frame2.grid(row=1, column=0, sticky="nsew")
+        # Configurar una barra de desplazamiento vertical para el cuadro de texto
+        scrollbar=tk.Scrollbar(frame2)
+        scrollbar.grid(row=0, column=3, sticky="ns")
+        # Cuadro de texto con desplazamiento
+        self.salida_texto = ScrolledText(frame2, wrap=tk.WORD)
+        self.salida_texto.grid(row=0, column=2, sticky="nsew")
+        self.salida_texto.config(yscrollcommand=scrollbar.set)
+        # Label para el estado de alarma
+        self.estado_alarma=tk.Label(frame2, font=LARGE_FONT, justify=tk.CENTER, fg="#84C9FB", bg="#363636")
+        self.estado_alarma.grid(row=0, column=1, sticky="nsew")
+        # Botón para ver el estado general de POTATO
+        button=tk.Button(frame2, text="Ver estado general POTATO", command=lambda: controller.show_frame(PageOne), activebackground="#121212", activeforeground="#84C9FB", relief=tk.FLAT)
+        button.grid(row=0, column=0, sticky="nsew")
+        # Configurar el sistema de columnas para que se expandan
+        frame2.columnconfigure(0, weight=2)
+        frame2.columnconfigure(1, weight=2)
+        frame2.columnconfigure(2, weight=4)
+        frame2.columnconfigure(3, weight=1)
+
+        # TAB 2: Gráficos de pertenencia fuzzy logic
+        canvas2 = FigureCanvasTkAgg(f2, tab2)
+        canvas2.get_tk_widget().grid(row=0, column=0, padx=5, pady=5)
+        canvas3 = FigureCanvasTkAgg(f3, tab2)
+        canvas3.get_tk_widget().grid(row=0, column=1, padx=5, pady=5)
+        canvas4 = FigureCanvasTkAgg(f4, tab2)
+        canvas4.get_tk_widget().grid(row=0, column=2, padx=5, pady=5)
+        canvas5 = FigureCanvasTkAgg(f5, tab2)
+        canvas5.get_tk_widget().grid(row=1, column=0, padx=5, pady=5)
+        canvas6 = FigureCanvasTkAgg(f6, tab2)
+        canvas6.get_tk_widget().grid(row=1, column=1, padx=5, pady=5)
+        
+        # TAB 3: Plot fuzzy glucosa alerta
+        tab3.grid_rowconfigure(0, weight=6)
+        tab3.grid_rowconfigure(1, weight=1)
+        tab3.grid_columnconfigure(0, weight=1)
+        frame_canvas9=tk.Frame(tab3)
+        frame_canvas9.grid(row=0, column=0, sticky="nsew")
+        self.canvas9= FigureCanvasTkAgg(f9, frame_canvas9)
+        self.canvas9.get_tk_widget().pack(side="top", fill=tk.BOTH, expand=True)
+        frame_toolbar2=tk.Frame(tab3)
+        frame_toolbar2.grid(row=1, column=0, sticky="nsew")
+        toolbar2=NavigationToolbar2Tk(self.canvas9, frame_toolbar2, pack_toolbar=False)
+        toolbar2.update()
+        toolbar2.pack()
+
+        # TAB 4: División en 2 gráficos de ARIMA
+        tab4.grid_rowconfigure(0, weight=6)
+        tab4.grid_rowconfigure(1, weight=1)
+        tab4.grid_columnconfigure(0, weight=1)
+        tab4.grid_columnconfigure(1, weight=1)
+        # Crear un Frame para el primer par de gráfico y toolbar
+        frame_canvas7 = tk.Frame(tab4)
+        frame_canvas7.grid(row=0, column=0, sticky="nsew")
+        self.canvas7 = FigureCanvasTkAgg(f7, frame_canvas7)
+        self.canvas7.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        toolbar3=NavigationToolbar2Tk(self.canvas7, frame_canvas7, pack_toolbar=False)
+        toolbar3.update()
+        toolbar3.pack()
+        # Crear un Frame para el segundo par de gráfico y toolbar
+        frame_canvas8 = tk.Frame(tab4)
+        frame_canvas8.grid(row=0, column=1, sticky="nsew")
+        self.canvas8 = FigureCanvasTkAgg(f8, frame_canvas8)
+        self.canvas8.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        toolbar4=NavigationToolbar2Tk(self.canvas8, frame_canvas8, pack_toolbar=False)
+        toolbar4.update()
+        toolbar4.pack()
+
+        # TAB 5: Compración ARIMAs
+        tab5.grid_rowconfigure(0, weight=6)
+        tab5.grid_rowconfigure(1, weight=1)
+        tab5.grid_columnconfigure(0, weight=1)
+        frame_canvas12=tk.Frame(tab5)
+        frame_canvas12.grid(row=0, column=0, sticky="nsew")
+        self.canvas12= FigureCanvasTkAgg(f12, frame_canvas12)
+        self.canvas12.get_tk_widget().pack(side="top", fill=tk.BOTH, expand=True)
+        frame_toolbar7=tk.Frame(tab5)
+        frame_toolbar7.grid(row=1, column=0, sticky="nsew")
+        toolbar7=NavigationToolbar2Tk(self.canvas9, frame_toolbar7, pack_toolbar=False)
+        toolbar7.update()
+        toolbar7.pack()
+
+        # TAB 6: Comparación de distintas predicciones a futuro en tiempo real
+        tab6.grid_rowconfigure(0, weight=4)
+        tab6.grid_rowconfigure(1, weight=5)
+        tab6.grid_rowconfigure(2, weight=1)
+        tab6.grid_columnconfigure(0, weight=1)
+        # plot a futuro
+        frame_canvas10=tk.Frame(tab6)
+        frame_canvas10.grid(row=0, column=0, sticky="nsew")
+        self.canvas10= FigureCanvasTkAgg(f10, frame_canvas10)
+        self.canvas10.get_tk_widget().pack(side="top", fill=tk.BOTH, expand=True)
+        toolbar5=NavigationToolbar2Tk(self.canvas10, frame_canvas10, pack_toolbar=False)
+        toolbar5.update()
+        toolbar5.pack()
+        frame_canvas10.rowconfigure(0, weight=0)
+        frame_canvas10.rowconfigure(1, weight=1)
+        # plot comparación
+        frame_canvas11=tk.Frame(tab6)
+        frame_canvas11.grid(row=1, column=0, sticky="nsew")
+        self.canvas11= FigureCanvasTkAgg(f11, frame_canvas11)
+        self.canvas11.get_tk_widget().pack(side="top", fill=tk.BOTH, expand=True)
+        toolbar6=NavigationToolbar2Tk(self.canvas11, frame_canvas11, pack_toolbar=False)
+        toolbar6.update()
+        toolbar6.pack()
+        frame_canvas11.rowconfigure(0, weight=0)
+        frame_canvas11.rowconfigure(1, weight=2)
+        # Frame vacío para espacio
+        frame_blank= tk.Frame(tab6)
+        frame_blank.grid(row=2, column=0, sticky="nsew")
+        label_blank = tk.Label(frame_blank, text="", justify=tk.CENTER, font=LARGE_FONT)
+        label_blank.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=1)
+
+
+    # Método para agregar texto al cuadro de texto de la tab1 de StartPage
+    def agregar_texto(self, texto, borrar=False):
+        if borrar:
+            self.salida_texto.delete(1.0, tk.END)  # Borra todo el contenido actual
+        self.salida_texto.insert("end", texto + "\n") # Agregar el texto al final y agregar un salto de línea
+    
+    # Método para actualizar el cuadro de texto del estado de alarma de la tab1 de StartPage
+    def actualizar_estado_alarma(self, estado_alarma):
+        self.estado_alarma.configure(text=estado_alarma)
+    
+    # Método para actualizar los gráficos de ARIMA (acf, pacf)
+    def actualizar_plot_ARIMA(self):
+        self.canvas7.draw()
+        self.canvas8.draw()
+    
+    # Método para actualizar gráficos de comparación de métodos de predicción
+    def actualizar_plot_predicciones(self):
+        self.canvas10.draw()
+        self.canvas11.draw()
+
+    # Método para actualizar gráfico para comparar arima con parámetros seleccionados y sacados con auto_arima
+    def actualizar_plot_predicciones_arima(self):
+        self.canvas12.draw()
+
+    # Método para representar las funciones de pertenencia (lógica difusa)
+    def actualizar_plot_fuzzy(self):
+        self.canvas9.draw()
+
+
+
+class PageOne(ttk.Frame):
+    def __init__(self, parent, controller):
+        ttk.Frame.__init__(self, parent)
+        tk.Label(self, text="ESTADO GENERAL DE POTATO (influenciado por alerta (influenciada por glucosa))",  font=LARGE_FONT, justify=tk.CENTER, fg="#84C9FB", bg="#363636").pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=22, pady=11)
+        # Crear un widget Label para mostrar la imagen
+        self.image_label = tk.Label(self, justify=tk.CENTER, bg="#363636")
+        self.image_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Etiqueta de estado general
+        self.text_label=tk.Label(self, font=("Verdana", 12, "bold"), justify=tk.CENTER, fg="#84C9FB", bg="#363636")
+        self.text_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=22, pady=11)
+        # Botón para volver a página principal
+        button = tk.Button(self, text="Volver a la página principal", command=lambda: controller.show_frame(StartPage), font=LARGE_FONT, relief=tk.FLAT, activebackground="#121212", activeforeground="#84C9FB")
+        button.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=22, pady=11)
+
+    # Método para actualizar pageone que muestra cara de POTATO de PageOne
+    def actualizar_imagen_y_texto_segun_estado(self, estadogen):
+        image = ""
+        text_img = ""
+        if (estadogen=='MIEDO'):
+            image= Image.open("cara_miedo_potato.png")
+            text_img="MIEDO"
+        elif (estadogen=='NORMAL'):
+            image = Image.open("cara_basica_potato.png")
+            text_img="NORMAL"
+        elif (estadogen== 'ALEGRE'):
+            image = Image.open("cara_alegre_potato.png")
+            text_img="ALEGRE"
+        elif (estadogen=='ALEGRECAL'):
+            image = Image.open("cara_alegre_calmado.png")
+            text_img="ALEGRE CALMADO"
+        else:
+            image = Image.open("cara_basica_potato.png")
+            text_img="NORMAL"
+        
+        self.photo = ImageTk.PhotoImage(image)
+        self.image_label.configure(image=self.photo)
+        self.image_label.image = self.photo
+        self.text_label.configure(text=text_img)
+
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# BUCLE- POGRAMA PRINCIPAL
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+i=0
+
+def update(simulator_glucosa, fuzzy_glucosa, i):
+    print('\niteración nº:', i)
+    print('datos_previos:', simulator_glucosa.datos_previos)
+    simulator_glucosa.update()
+    fuzzy_glucosa.nueva_medida_glucosa=simulator_glucosa.datos_historicos_glucosa['Blood Glucose (mg/dL)'][-1]
+    fuzzy_glucosa.do_fuzzy()
+
+
+def main():
+    print("\nComienzo del programa...\n")
+    # Declaración (Inicio) de la ventana
+    app=Ventana()
+    # Declaración de objetos de clase 'GlucosaSimulator' y 'FuzzyGlucosa'
+    simulator_glucosa=GlucosaSimulator(app)
+    fuzzy_glucosa=FuzzyGlucosa(app)
+    # Representar funciones de pertenencia
+    fuzzy_glucosa.plot_funciones_pertenencia()
+
+    # Uso de la función para cargar datos históricos de glucosa en sangre
+    simulator_glucosa.datos_historicos_glucosa, simulator_glucosa.prediccion, simulator_glucosa.estadisticas= simulator_glucosa.obtener_datos_historicos_glucosa()
+    # Índice con frecuencia adecuada para los datos históricos cargados
+    if len(simulator_glucosa.datos_historicos_glucosa) > 0:
+        simulator_glucosa.datos_historicos_glucosa.index = pd.to_datetime(simulator_glucosa.datos_historicos_glucosa.index)
+    if len(simulator_glucosa.prediccion) > 0:
+        simulator_glucosa.prediccion.index = pd.to_datetime(simulator_glucosa.prediccion.index)
+    if len(simulator_glucosa.estadisticas) > 0:
+        simulator_glucosa.estadisticas.index = pd.to_datetime(simulator_glucosa.estadisticas.index)
+
+    print('longitud datos simulados:', len(simulator_glucosa.datos_historicos_glucosa))
+    print('longitud de predicción:', len(simulator_glucosa.prediccion))
+    simulator_glucosa.fila_actual=len(simulator_glucosa.datos_historicos_glucosa)+1
+    simulator_glucosa.medicion_prediccion = True
+
+    #iteration_delay=300000 #cada 5 minutos
+    iteration_delay=1000
+    
+    ani=FuncAnimation(f1,partial(update, simulator_glucosa, fuzzy_glucosa), interval=iteration_delay)
+    app.mainloop()
+
+
+main()
